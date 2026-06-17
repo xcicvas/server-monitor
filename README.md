@@ -1,57 +1,68 @@
-# React + TypeScript + Vite
+# 服务器监控面板
 
-This template provides a minimal setup to get React working in Vite with HMR and some ESLint rules.
+简洁的服务器监控工具，实时展示 CPU、内存、磁盘、网络等系统指标，支持多服务器管理。
 
-Currently, two official plugins are available:
+## 系统架构
 
-- [@vitejs/plugin-react](https://github.com/vitejs/vite-plugin-react/blob/main/packages/plugin-react) uses [Babel](https://babeljs.io/) for Fast Refresh
-- [@vitejs/plugin-react-swc](https://github.com/vitejs/vite-plugin-react/blob/main/packages/plugin-react-swc) uses [SWC](https://swc.rs/) for Fast Refresh
-
-## Expanding the ESLint configuration
-
-If you are developing a production application, we recommend updating the configuration to enable type-aware lint rules:
-
-```js
-export default tseslint.config({
-  extends: [
-    // Remove ...tseslint.configs.recommended and replace with this
-    ...tseslint.configs.recommendedTypeChecked,
-    // Alternatively, use this for stricter rules
-    ...tseslint.configs.strictTypeChecked,
-    // Optionally, add this for stylistic rules
-    ...tseslint.configs.stylisticTypeChecked,
-  ],
-  languageOptions: {
-    // other options...
-    parserOptions: {
-      project: ['./tsconfig.node.json', './tsconfig.app.json'],
-      tsconfigRootDir: import.meta.dirname,
-    },
-  },
-})
+```
+┌──────────────────────────────────────┐
+│         监控面板（浏览器）              │
+│       http://localhost:5173            │
+└──────────────┬───────────────────────┘
+               │ HTTP 轮询
+               ▼
+┌──────────────────────────────────────┐
+│       Agent（被监控服务器）            │
+│   node api/agent.js (默认端口 7001)   │
+└──────────────────────────────────────┘
 ```
 
-You can also install [eslint-plugin-react-x](https://github.com/Rel1cx/eslint-react/tree/main/packages/plugins/eslint-plugin-react-x) and [eslint-plugin-react-dom](https://github.com/Rel1cx/eslint-react/tree/main/packages/plugins/eslint-plugin-react-dom) for React-specific lint rules:
+## 快速开始
 
-```js
-// eslint.config.js
-import reactX from 'eslint-plugin-react-x'
-import reactDom from 'eslint-plugin-react-dom'
+### 1. 安装依赖
 
-export default tseslint.config({
-  extends: [
-    // other configs...
-    // Enable lint rules for React
-    reactX.configs['recommended-typescript'],
-    // Enable lint rules for React DOM
-    reactDom.configs.recommended,
-  ],
-  languageOptions: {
-    // other options...
-    parserOptions: {
-      project: ['./tsconfig.node.json', './tsconfig.app.json'],
-      tsconfigRootDir: import.meta.dirname,
-    },
-  },
-})
+```bash
+npm install
 ```
+
+### 2. 启动面板
+
+```bash
+npm run dev
+```
+
+浏览器打开 http://localhost:5173
+
+### 3. 启动 Agent
+
+在被监控的服务器上运行：
+
+```bash
+node api/agent.js
+```
+
+Agent 默认监听 7001 端口。
+
+### 4. 添加服务器
+
+在面板中点击「添加服务器」，填入 Agent 地址即可。
+
+## 命令
+
+| 命令 | 说明 |
+|------|------|
+| `npm run dev` | 启动前端面板 |
+| `npm run build` | 构建生产版本 |
+| `node api/agent.js` | 启动 Agent |
+
+## 自定义 Agent 端口
+
+```bash
+AGENT_PORT=8000 node api/agent.js
+```
+
+## 技术栈
+
+- **前端**：React + TypeScript + Tailwind CSS
+- **状态管理**：Zustand + localStorage 持久化
+- **Agent**：Node.js + Express

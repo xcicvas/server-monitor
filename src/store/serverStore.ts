@@ -1,10 +1,8 @@
 import { create } from 'zustand';
 import { persist } from 'zustand/middleware';
+import { createJSONStorage } from 'zustand/middleware';
 
 // ─── 安全工具：Token 混淆 ──────────────────────────────────────────────────
-// 不提供真正的加密（前端无法安全存储密钥），但能防止：
-// 1. 浏览器 DevTools 直接看到明文令牌
-// 2. XSS 脚本轻易读取到明文
 function obfuscate(str: string): string {
   try {
     return btoa(encodeURIComponent(str));
@@ -21,10 +19,29 @@ function deobfuscate(str: string): string {
   }
 }
 
-// ─── 自定义 sessionStorage 存储 ─────────────────────────────────────────────
-// Zustand persist 会自动处理序列化，只需提供原始的存储 API 接口
-import { createJSONStorage } from 'zustand/middleware';
 const sessionStorage_ = createJSONStorage(() => sessionStorage);
+
+// ─── 历史数据内存 Store（不持久化）────────────────────────────────────────
+const HISTORY_MAX = 30;
+
+interface HistoryEntry {
+  timestamp: number;
+  cpu: number;
+  memory: number;
+  disk: number;
+}
+
+type HistoryMap = Map<string, HistoryEntry[]>;
+
+const historyMap: HistoryMap = new Map();
+
+export function useServerHistory(serverId: string): HistoryEntry[] {
+  // 订阅 store 变化以触发重渲染
+  useServerStore((s) => s.servers);
+  return historyMap.get(serverId) ?? [];
+}
+
+export { historyMap, HISTORY_MAX };
 
 export interface ServerMetrics {
   hostname: string;
@@ -104,8 +121,10 @@ export const useServerStore = create<ServerStore>()(
           ],
         })),
 
-      removeServer: (id) =>
-        set((state) => ({ servers: state.servers.filter((s) => s.id !== id) })),
+      removeServer: (id) => {
+        historyMap.delete(id);
+        set((state) => ({ servers: state.servers.filter((s) => s.id !== id) }));
+      },
 
       updateServer: (id, updates) =>
         set((state) => ({
@@ -128,19 +147,33 @@ export const useServerStore = create<ServerStore>()(
         })),
 
       setMetrics: (id, metrics, err) =>
-        set((state) => ({
-          servers: state.servers.map((s) =>
-            s.id === id
-              ? {
-                  ...s,
-                  metrics,
-                  lastCheckTime: Date.now(),
-                  status: err ? 'offline' : 'online',
-                  error: err ?? null,
-                }
-              : s
-          ),
-        })),
+        set((state) => {
+          // 更新历史记录
+          if (!err && metrics) {
+            const history = historyMap.get(id) ?? [];
+            history.push({
+              timestamp: Date.now(),
+              cpu: metrics.cpu.usagePercent,
+              memory: metrics.memory.usagePercent,
+              disk: metrics.disk.usagePercent,
+            });
+            if (history.length > HISTORY_MAX) history.shift();
+            historyMap.set(id, history);
+          }
+          return {
+            servers: state.servers.map((s) =>
+              s.id === id
+                ? {
+                    ...s,
+                    metrics,
+                    lastCheckTime: Date.now(),
+                    status: err ? 'offline' : 'online',
+                    error: err ?? null,
+                  }
+                : s
+            ),
+          };
+        }),
     }),
     {
       name: 'server-monitor-storage',

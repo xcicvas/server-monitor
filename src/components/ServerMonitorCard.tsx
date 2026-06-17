@@ -1,5 +1,10 @@
-import { RefreshCw, Trash2, Server } from 'lucide-react';
+import { RefreshCw, Trash2, Server, AlertTriangle } from 'lucide-react';
 import { CircularProgress, LinearProgress } from './ProgressIndicator';
+import { AnimatedNumber } from './AnimatedNumber';
+import { SparklineChart } from './SparklineChart';
+import { HealthScore, calcHealthScore } from './HealthScore';
+import { PulseIndicator } from './PulseIndicator';
+import { useServerHistory } from '../store/serverStore';
 import type { ServerData } from '../store/serverStore';
 
 interface ServerMonitorCardProps {
@@ -23,37 +28,47 @@ function formatUptime(seconds: number): string {
   const d = Math.floor(seconds / 86400);
   const h = Math.floor((seconds % 86400) / 3600);
   const m = Math.floor((seconds % 3600) / 60);
-  if (d > 0) return `${d}d ${h}h`;
-  if (h > 0) return `${h}h ${m}m`;
-  return `${m}m`;
+  if (d > 0) return `${d}天${h}小时`;
+  if (h > 0) return `${h}小时${m}分`;
+  return `${m}分钟`;
 }
 
 function barColor(v: number): string {
-  if (v < 60) return '#16a34a';   // green
-  if (v < 80) return '#ca8a04';  // yellow
-  return '#dc2626';               // red
+  if (v < 60) return '#16a34a';
+  if (v < 80) return '#ca8a04';
+  return '#dc2626';
 }
+
+const ALERT_THRESHOLD = 85; // 告警阈值
 
 export function ServerMonitorCard({ server, onDelete, onRefresh, index }: ServerMonitorCardProps) {
   const isOnline = server.status === 'online';
   const isChecking = server.status === 'checking';
   const m = server.metrics;
+  const history = useServerHistory(server.id);
 
   const cpuPct = m?.cpu.usagePercent ?? 0;
   const memPct = m?.memory.usagePercent ?? 0;
   const diskPct = m?.disk.usagePercent ?? 0;
   const netMbps = (m?.network.rxMbps ?? 0) + (m?.network.txMbps ?? 0);
 
+  const healthScore = m ? calcHealthScore(m) : 0;
+
+  // 是否触发告警
+  const isAlert = isOnline && (
+    cpuPct >= ALERT_THRESHOLD || memPct >= ALERT_THRESHOLD || diskPct >= ALERT_THRESHOLD
+  );
+
   return (
     <article
-      className="card p-5 animate-slide-up overflow-hidden"
+      className={`card p-5 animate-slide-up overflow-hidden transition-all duration-300 ${isAlert ? 'ring-2 ring-red-300 ring-offset-1' : ''}`}
       style={{ animationDelay: `${index * 50}ms` }}
     >
       {/* 顶部状态条 */}
-      <div className="flex items-start justify-between gap-3 mb-5">
+      <div className="flex items-start justify-between gap-3 mb-4">
         <div className="flex items-center gap-3 min-w-0 flex-1">
           {/* 状态图标 */}
-          <div className={`w-9 h-9 rounded-xl flex items-center justify-center shrink-0 border text-xs font-semibold
+          <div className={`relative w-10 h-10 rounded-xl flex items-center justify-center shrink-0 border text-xs font-semibold
             ${isOnline ? 'bg-green-50 border-green-200 text-green-700' :
               isChecking ? 'bg-yellow-50 border-yellow-200 text-yellow-700' :
               'bg-red-50 border-red-200 text-red-600'}`}
@@ -63,10 +78,22 @@ export function ServerMonitorCard({ server, onDelete, onRefresh, index }: Server
             ) : (
               <Server className="w-4 h-4" strokeWidth={2.5} />
             )}
+            {/* 脉冲指示器 */}
+            <div className="absolute -top-1 -right-1">
+              <PulseIndicator status={server.status} />
+            </div>
           </div>
 
           <div className="min-w-0 flex-1">
-            <h3 className="text-sm font-semibold text-stone-800 truncate leading-tight">{server.name}</h3>
+            <div className="flex items-center gap-2">
+              <h3 className="text-sm font-semibold text-stone-800 truncate leading-tight">{server.name}</h3>
+              {isAlert && (
+                <span className="flex items-center gap-0.5 shrink-0 text-[10px] font-bold px-1.5 py-0.5 rounded-full bg-red-50 text-red-600 border border-red-200">
+                  <AlertTriangle className="w-3 h-3" strokeWidth={2.5} />
+                  告警
+                </span>
+              )}
+            </div>
             <p className="text-xs text-stone-400 font-mono mt-0.5 truncate">
               {m?.hostname ?? '—'}
               {m?.arch ? <span className="ml-1 text-stone-300">· {m.arch}</span> : null}
@@ -74,38 +101,41 @@ export function ServerMonitorCard({ server, onDelete, onRefresh, index }: Server
           </div>
         </div>
 
-        {/* 在线状态标签 */}
-        <span className={`shrink-0 text-[11px] font-semibold px-2.5 py-1 rounded-full
-          ${isOnline ? 'bg-green-50 text-green-700 border border-green-200' :
-            isChecking ? 'bg-yellow-50 text-yellow-700 border border-yellow-200' :
-            'bg-red-50 text-red-600 border border-red-200'}`}
-        >
-          {isOnline ? '在线' : isChecking ? '检测中' : '离线'}
-        </span>
+        {/* 健康评分 */}
+        <div className="shrink-0">
+          <HealthScore score={healthScore} size={64} strokeWidth={5} />
+        </div>
       </div>
 
-      {/* 主要指标：CPU + 内存 */}
+      {/* 主要指标：CPU + 内存 + 趋势图 */}
       <div className="grid grid-cols-2 gap-3 mb-4">
         <MetricTile
           label="CPU"
           value={cpuPct}
           detail={m ? `${m.cpu.cores}核 · ${m.cpu.model?.split(' ').slice(0, 3).join(' ')}` : '—'}
           color={barColor(cpuPct)}
+          history={history.map(h => h.cpu)}
+          isAlert={cpuPct >= ALERT_THRESHOLD}
         />
         <MetricTile
           label="内存"
           value={memPct}
           detail={m ? `${formatBytes(m.memory.used)} / ${formatBytes(m.memory.total)}` : '—'}
           color={barColor(memPct)}
+          history={history.map(h => h.memory)}
+          isAlert={memPct >= ALERT_THRESHOLD}
         />
       </div>
 
-      {/* 次要指标 */}
+      {/* 磁盘 + 网络 */}
       <div className="space-y-3">
         <div>
           <div className="flex items-center justify-between mb-1.5">
             <span className="text-xs text-stone-500 font-medium">磁盘</span>
-            <span className="text-xs font-mono text-stone-500">
+            <span className="text-xs font-mono text-stone-500 flex items-center gap-2">
+              {isAlert && diskPct >= ALERT_THRESHOLD && (
+                <AlertTriangle className="w-3 h-3 text-red-500" strokeWidth={2.5} />
+              )}
               {m ? `${formatBytes(m.disk.used)} / ${formatBytes(m.disk.total)}` : '—'}
             </span>
           </div>
@@ -167,18 +197,40 @@ interface MetricTileProps {
   value: number;
   detail: string;
   color: string;
+  history?: number[];
+  isAlert?: boolean;
 }
 
-const MetricTile: React.FC<MetricTileProps> = ({ label, value, detail, color }) => (
-  <div className="flex items-center gap-3 p-3 rounded-xl bg-stone-50 border border-stone-100">
-    <CircularProgress value={value} color={color} size={56} strokeWidth={5}>
-      <span className="text-sm font-bold text-stone-800 font-mono leading-none">
-        {value.toFixed(0)}<span className="text-[9px] text-stone-400">%</span>
-      </span>
-    </CircularProgress>
+const MetricTile: React.FC<MetricTileProps> = ({ label, value, detail, color, history = [], isAlert }) => (
+  <div className={`flex items-center gap-2 p-3 rounded-xl bg-stone-50 border transition-colors ${isAlert ? 'border-red-200 bg-red-50/50' : 'border-stone-100'}`}>
+    <div className="relative shrink-0">
+      <CircularProgress value={value} color={color} size={56} strokeWidth={5}>
+        <div className="flex flex-col items-center leading-none">
+          <AnimatedNumber
+            value={value}
+            decimals={0}
+            className="text-sm font-bold text-stone-800 font-mono"
+          />
+          <span className="text-[9px] text-stone-400">%</span>
+        </div>
+      </CircularProgress>
+    </div>
     <div className="min-w-0 flex-1">
-      <div className="text-[10px] font-semibold text-stone-400 uppercase tracking-wider mb-1">{label}</div>
-      <div className="text-xs text-stone-600 font-mono truncate leading-tight">{detail}</div>
+      <div className="flex items-center justify-between mb-0.5">
+        <span className="text-[10px] font-semibold text-stone-400 uppercase tracking-wider">{label}</span>
+        {isAlert && <AlertTriangle className="w-3 h-3 text-red-500 shrink-0" strokeWidth={2.5} />}
+      </div>
+      <div className="text-[10px] text-stone-500 font-mono truncate leading-tight">{detail}</div>
+      {/* 趋势图 */}
+      <div className="mt-1.5">
+        <SparklineChart
+          data={history}
+          width={100}
+          height={28}
+          fill={false}
+          dangerThreshold={ALERT_THRESHOLD}
+        />
+      </div>
     </div>
   </div>
 );

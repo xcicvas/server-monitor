@@ -4,12 +4,26 @@ import { X, Server, Terminal } from 'lucide-react';
 interface AddServerModalProps {
   isOpen: boolean;
   onClose: () => void;
-  onAdd: (data: { name: string; address: string; interval: number }) => void;
+  onAdd: (data: { name: string; address: string; token?: string; interval: number }) => void;
+}
+
+// ─── SSRF 防护：禁止内网 IP ────────────────────────────────────────────────
+const PRIVATE_IP_RE = /^(127\.|10\.|172\.(1[6-9]|2[0-9]|3[0-1])\.|192\.168\.|localhost|::1|fe80)/i;
+
+function isPrivateAddress(address: string): boolean {
+  try {
+    const urlStr = /^https?:\/\//i.test(address) ? address : `http://${address}`;
+    const u = new URL(urlStr);
+    return PRIVATE_IP_RE.test(u.hostname);
+  } catch {
+    return false;
+  }
 }
 
 export function AddServerModal({ isOpen, onClose, onAdd }: AddServerModalProps) {
   const [name, setName] = useState('');
   const [address, setAddress] = useState('');
+  const [token, setToken] = useState('');
   const [interval, setInterval] = useState(5);
   const [errors, setErrors] = useState<Record<string, string>>({});
 
@@ -17,6 +31,7 @@ export function AddServerModal({ isOpen, onClose, onAdd }: AddServerModalProps) 
     if (isOpen) {
       setName('');
       setAddress('');
+      setToken('');
       setInterval(5);
       setErrors({});
     }
@@ -37,8 +52,13 @@ export function AddServerModal({ isOpen, onClose, onAdd }: AddServerModalProps) 
     if (!address.trim()) {
       e.address = '请输入 Agent 地址';
     } else {
-      const urlStr = /^https?:\/\//i.test(address.trim()) ? address.trim() : `http://${address.trim()}`;
-      try { new URL(urlStr); } catch { e.address = '地址格式不正确'; }
+      const normalized = /^https?:\/\//i.test(address.trim())
+        ? address.trim()
+        : `http://${address.trim()}`;
+      try { new URL(normalized); } catch { e.address = '地址格式不正确'; }
+      if (!e.address && isPrivateAddress(address.trim())) {
+        e.address = '不支持内网 IP 地址，请使用公网可访问的 Agent 地址';
+      }
     }
     if (interval < 1 || interval > 300) e.interval = '刷新间隔需在 1-300 秒之间';
     setErrors(e);
@@ -49,7 +69,7 @@ export function AddServerModal({ isOpen, onClose, onAdd }: AddServerModalProps) 
     e.preventDefault();
     if (!validate()) return;
     const urlStr = /^https?:\/\//i.test(address.trim()) ? address.trim() : `http://${address.trim()}`;
-    onAdd({ name: name.trim(), address: urlStr, interval });
+    onAdd({ name: name.trim(), address: urlStr, token: token.trim(), interval });
     onClose();
   };
 
@@ -110,6 +130,24 @@ export function AddServerModal({ isOpen, onClose, onAdd }: AddServerModalProps) 
             ) : (
               <p className="mt-1.5 text-xs text-stone-400">Agent 默认提供 /api/metrics 接口</p>
             )}
+          </div>
+
+          {/* 访问令牌（可选） */}
+          <div>
+            <label className="block text-xs font-semibold text-stone-500 uppercase tracking-wider mb-1.5">
+              访问令牌 <span className="text-stone-300 normal-case font-normal">(可选)</span>
+            </label>
+            <input
+              type="password"
+              value={token}
+              onChange={(e) => setToken(e.target.value)}
+              placeholder="与 Agent 的 AUTH_TOKEN 一致"
+              className="input input-mono"
+              autoComplete="off"
+            />
+            <p className="mt-1.5 text-xs text-stone-400">
+              Agent 设置了 <code className="px-1 py-0.5 rounded bg-stone-100 text-stone-600 font-mono text-[10px]">AUTH_TOKEN</code> 时必填
+            </p>
           </div>
 
           <div>

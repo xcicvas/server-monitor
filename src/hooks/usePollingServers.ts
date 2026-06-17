@@ -21,20 +21,29 @@ function resolveAgentUrl(rawAddress: string): string {
 }
 
 /** 统一的采集逻辑：调用 Agent HTTP 接口，失败时返回错误 */
-async function fetchMetrics(address: string): Promise<{ metrics: ServerMetrics | null; error: string | null }> {
+async function fetchMetrics(
+  address: string,
+  token: string
+): Promise<{ metrics: ServerMetrics | null; error: string | null }> {
   const url = resolveAgentUrl(address);
+  const headers: Record<string, string> = { Accept: 'application/json' };
+  if (token) headers['Authorization'] = `Bearer ${token}`;
+
   try {
     const controller = new AbortController();
     const timer = setTimeout(() => controller.abort(), 5000);
     const resp = await fetch(url, {
       method: 'GET',
       signal: controller.signal,
-      headers: { Accept: 'application/json' },
+      headers,
     });
     clearTimeout(timer);
 
     if (!resp.ok) {
-      return { metrics: null, error: 'HTTP ' + resp.status + ' ' + resp.statusText };
+      if (resp.status === 401) return { metrics: null, error: '令牌无效，请检查 Access Token' };
+      if (resp.status === 403) return { metrics: null, error: '拒绝访问，Token 不匹配' };
+      if (resp.status === 429) return { metrics: null, error: '请求过于频繁，请稍后再试' };
+      return { metrics: null, error: `HTTP ${resp.status} ${resp.statusText}` };
     }
     const json = await resp.json();
 
@@ -64,7 +73,7 @@ async function fetchMetrics(address: string): Promise<{ metrics: ServerMetrics |
           usagePercent: Number(d.disk?.usagePercent ?? d.disk?.usage ?? 0),
         },
         network: {
-          interfaces: Number(d.network?.interfaces || 0),
+          interfaces: Number(d.network?.interfaces || d.network?.interfaces?.length || 0),
           rxMbps: Number(d.network?.rxMbps || 0),
           txMbps: Number(d.network?.txMbps || 0),
         },
@@ -91,7 +100,7 @@ export function usePollingServers() {
   const probeOne = useCallback(
     async (s: ServerData) => {
       setStatus(s.id, 'checking');
-      const { metrics, error } = await fetchMetrics(s.address);
+      const { metrics, error } = await fetchMetrics(s.address, s.token || '');
       setMetrics(s.id, metrics as ServerMetrics, error);
     },
     [setStatus, setMetrics]

@@ -4,8 +4,10 @@ interface AnimatedNumberProps {
   value: number;
   /** 小数位数 */
   decimals?: number;
-  /** 前缀如 "+" 或 "%" */
+  /** 前缀如 "+" 或 "" */
   prefix?: string;
+  /** 后缀如 "%" 或 "ms" */
+  suffix?: string;
   /** 动画时长 ms */
   duration?: number;
   className?: string;
@@ -15,6 +17,7 @@ export function AnimatedNumber({
   value,
   decimals = 0,
   prefix = '',
+  suffix = '',
   duration = 600,
   className = '',
 }: AnimatedNumberProps) {
@@ -50,5 +53,5 @@ export function AnimatedNumber({
 
   const formatted = decimals > 0 ? display.toFixed(decimals) : Math.round(display).toString();
 
-  return <span className={className}>{prefix}{formatted}</span>;
+  return <span className={className}>{prefix}{formatted}{suffix}</span>;
 }

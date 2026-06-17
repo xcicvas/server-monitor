@@ -5,6 +5,7 @@ import { Header } from './components/Header';
 import { ServerMonitorCard } from './components/ServerMonitorCard';
 import { AddServerModal } from './components/AddServerModal';
 import { EmptyState } from './components/EmptyState';
+import { OverviewStats } from './components/OverviewStats';
 
 export default function App() {
   const [isModalOpen, setIsModalOpen] = useState(false);
@@ -33,20 +34,26 @@ export default function App() {
         {servers.length === 0 ? (
           <EmptyState onAddClick={() => setIsModalOpen(true)} />
         ) : (
-          <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
-            {servers.map((server, index) => (
-              <ServerMonitorCard
-                key={server.id}
-                server={server}
-                index={index}
-                onDelete={handleDelete}
-                onRefresh={(id) => {
-                  const s = servers.find((x) => x.id === id);
-                  if (s) probeOne(s);
-                }}
-              />
-            ))}
-          </div>
+          <>
+            {/* 总览统计 */}
+            <OverviewStats />
+
+            {/* 服务器卡片 */}
+            <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
+              {servers.map((server, index) => (
+                <ServerMonitorCard
+                  key={server.id}
+                  server={server}
+                  index={index}
+                  onDelete={handleDelete}
+                  onRefresh={(id) => {
+                    const s = servers.find((x) => x.id === id);
+                    if (s) probeOne(s);
+                  }}
+                />
+              ))}
+            </div>
+          </>
         )}
       </main>
 

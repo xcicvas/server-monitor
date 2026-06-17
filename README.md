@@ -246,6 +246,111 @@ server-monitor/
 
 ---
 
+## 🛡️ 安全使用指南
+
+本章节详细介绍如何加固你的 Agent 探针服务，防止未授权访问和恶意请求。
+
+### 1. 开启访问令牌认证
+
+默认情况下，Agent 不设置任何访问限制，任何知道地址的人都可以获取服务器指标。在公网环境下**强烈建议**开启令牌认证：
+
+```bash
+# 设置一个强令牌（建议使用 32 位以上的随机字符串）
+AUTH_TOKEN=你的强令牌 node api/agent.js
+
+# 或者写入 .env 文件（需安装 dotenv）
+# echo "AUTH_TOKEN=你的强令牌" > .env
+# node api/agent.js
+```
+
+> ⚠️ **重要提示**：如果未设置 `AUTH_TOKEN`，Agent 启动时会显示红色警告 `⚠️ 警告：未设置 AUTH_TOKEN`，此时任何人都可以访问你的服务器数据。
+
+启用后，面板端需要在「添加服务器」时填写与 `AUTH_TOKEN` 完全一致的令牌，否则会返回以下错误之一：
+- `401 未提供访问令牌` — 请求没有携带令牌
+- `403 令牌无效` — 令牌与 Agent 配置不匹配
+
+### 2. 限制来源域名（CORS）
+
+默认 CORS 策略允许所有来源（`origin: *`），如果你的 Agent 只服务于特定域名或 IP，可以限制只能从指定来源访问：
+
+```bash
+# 单个来源
+ALLOWED_ORIGINS=http://localhost:5173 node api/agent.js
+
+# 多个来源（用英文逗号分隔，无空格）
+ALLOWED_ORIGINS=http://localhost:5173,https://example.com,https://监控面板.com node api/agent.js
+```
+
+> 💡 **提示**：本地开发时建议同时设置 `ALLOWED_ORIGINS=http://localhost:5173`，否则浏览器控制台会报 CORS 错误。
+
+### 3. 请求频率限制（防滥用）
+
+Agent 内置了基于 IP 的请求频率限制，防止恶意频繁请求：
+
+- **时间窗口**：10 秒
+- **请求上限**：60 次
+- **触发后的响应**：返回 `429 请求过于频繁，请稍后再试`
+
+频率限制仅在设置了 `AUTH_TOKEN` 时生效（未设置令牌时无法识别请求来源，限制无意义）。
+
+### 4. 多重安全叠加
+
+以上三种机制可以叠加使用，形成纵深防护：
+
+| 防护层级 | 配置项 | 作用 |
+|---------|-------|------|
+| 第一层 | `AUTH_TOKEN` | 鉴别请求者身份，无令牌或令牌错误直接拒绝 |
+| 第二层 | `ALLOWED_ORIGINS` | 限制只能从指定域名/地址发起请求 |
+| 第三层 | 限速中间件 | 防止单 IP 大量请求耗尽资源 |
+
+### 5. 安全配置组合示例
+
+**本地开发（需要本地面板访问）**：
+```bash
+AUTH_TOKEN=dev_secret_123 ALLOWED_ORIGINS=http://localhost:5173 node api/agent.js
+```
+
+**内网生产环境（仅内网可访问）**：
+```bash
+AUTH_TOKEN=内网专用强令牌 node api/agent.js
+# 内网本身已隔离，可不设置 ALLOWED_ORIGINS
+```
+
+**公网生产环境（最高安全）**：
+```bash
+AUTH_TOKEN=$(openssl rand -base64 32) ALLOWED_ORIGINS=https://你的域名.com node api/agent.js
+```
+
+### 6. 令牌生成工具
+
+可以使用以下方式生成安全的随机令牌：
+
+```bash
+# Linux/macOS（使用 OpenSSL）
+openssl rand -base64 32
+
+# Linux（使用 /dev/urandom）
+head -c 32 /dev/urandom | base64
+
+# Node.js
+node -e "console.log(require('crypto').randomBytes(32).toString('base64'))"
+```
+
+### 7. 查看当前安全状态
+
+启动 Agent 后，控制台会输出当前安全配置状态：
+
+```
+🚀 Agent 已启动 | 端口: 7001
+   ├── 访问令牌: ✅ 已配置 (显示前8位...后8位)
+   ├── CORS 策略: ✅ 已限制 (显示允许的来源数)
+   └── 频率限制: ✅ 已启用 (60次/10秒)
+
+⚠️  警告：未设置 AUTH_TOKEN，任何人都可以访问此 Agent！
+```
+
+---
+
 ## ❓ 常见问题
 
 ### Q: 面板显示"离线"，无法连接

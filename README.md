@@ -554,6 +554,21 @@ sudo systemctl status server-monitor-agent
 
 项目提供了开箱即用的一键部署脚本，适用于 Ubuntu / Debian / CentOS / RHEL / Rocky / AlmaLinux / macOS。
 
+**方式一：只下载这一个脚本文件（推荐）**
+
+脚本完全自包含，运行时自动从 GitHub 拉取 `agent.js` 和 `package.json`，无需克隆整个项目：
+
+```bash
+# 只下载 deploy.sh 一个文件
+curl -fsSL https://raw.githubusercontent.com/xcicvas/server-monitor/main/scripts/deploy.sh -o deploy.sh
+
+# 赋予执行权限并运行
+chmod +x deploy.sh
+sudo ./deploy.sh
+```
+
+**方式二：克隆整个项目后运行**
+
 ```bash
 # 克隆项目
 git clone https://github.com/xcicvas/server-monitor.git
@@ -564,9 +579,12 @@ chmod +x scripts/deploy.sh
 
 # 全自动部署（默认配置，自动生成密钥和密码）
 sudo ./scripts/deploy.sh
+```
 
-# 自定义参数部署
-sudo ./scripts/deploy.sh \
+**自定义参数部署**
+
+```bash
+sudo ./deploy.sh \
   -p 7001 \
   -j my_very_long_secret_key_here \
   -u admin \
@@ -574,10 +592,10 @@ sudo ./scripts/deploy.sh \
   -o https://monitor.yourdomain.com
 
 # 查看帮助
-./scripts/deploy.sh -h
+./deploy.sh -h
 
 # 卸载
-sudo ./scripts/deploy.sh --uninstall
+sudo ./deploy.sh --uninstall
 ```
 
 **脚本自动完成以下操作：**

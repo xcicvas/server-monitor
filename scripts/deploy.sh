@@ -65,6 +65,9 @@ ADMIN_USERNAME="admin"
 ADMIN_PASSWORD=""
 INSTALL_SERVICE=true
 MODE="install"
+GITHUB_REPO="xcicvas/server-monitor"
+GITHUB_BRANCH="main"
+GITHUB_RAW="https://raw.githubusercontent.com/${GITHUB_REPO}/${GITHUB_BRANCH}"
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -164,24 +167,49 @@ generate_secret() {
 
 copy_agent_files() {
   log_info "准备 Agent 文件..."
-  if [[ ! -f "${AGENT_FILE}" ]]; then
-    log_error "找不到 Agent 文件: ${AGENT_FILE}"
-    exit 1
-  fi
+
   ${SUDO} mkdir -p "${INSTALL_DIR}/api"
   ${SUDO} mkdir -p "${INSTALL_DIR}/data"
-  ${SUDO} cp "${AGENT_FILE}" "${INSTALL_DIR}/api/agent.js"
-
-  if [[ -f "${PROJECT_DIR}/package.json" ]]; then
-    ${SUDO} cp "${PROJECT_DIR}/package.json" "${INSTALL_DIR}/package.json"
-  fi
   ${SUDO} chmod -R 755 "${INSTALL_DIR}"
 
-  if [[ -d "${INSTALL_DIR}/node_modules" ]]; then
-    log_info "已存在 node_modules，跳过依赖安装"
+  # 策略一：本地项目中存在 agent.js，直接复制
+  if [[ -f "${AGENT_FILE}" ]]; then
+    ${SUDO} cp "${AGENT_FILE}" "${INSTALL_DIR}/api/agent.js"
+    if [[ -f "${PROJECT_DIR}/package.json" ]]; then
+      ${SUDO} cp "${PROJECT_DIR}/package.json" "${INSTALL_DIR}/package.json"
+    fi
+    log_ok "从本地项目复制 Agent 文件"
+  # 策略二：从 GitHub 直接下载
   else
-    (cd "${INSTALL_DIR}" && npm install --omit=dev 2>&1 | tail -5)
-    log_ok "Agent 文件已部署到 ${INSTALL_DIR}"
+    log_info "本地未找到 Agent 文件，从 GitHub 下载..."
+    local tmp_agent
+    tmp_agent="$(mktemp /tmp/server-monitor-agent-XXXXXX.js)"
+    local tmp_pkg
+    tmp_pkg="$(mktemp /tmp/server-monitor-pkg-XXXXXX.json)"
+
+    if curl -fsSL "${GITHUB_RAW}/api/agent.js" -o "${tmp_agent}" 2>/dev/null \
+      && curl -fsSL "${GITHUB_RAW}/package.json" -o "${tmp_pkg}" 2>/dev/null; then
+      ${SUDO} cp "${tmp_agent}" "${INSTALL_DIR}/api/agent.js"
+      ${SUDO} cp "${tmp_pkg}" "${INSTALL_DIR}/package.json"
+      rm -f "${tmp_agent}" "${tmp_pkg}"
+      log_ok "从 GitHub 下载 Agent 文件"
+    else
+      rm -f "${tmp_agent}" "${tmp_pkg}"
+      log_error "无法下载 Agent 文件，请检查网络连接"
+      log_error "手动命令: curl ${GITHUB_RAW}/api/agent.js"
+      exit 1
+    fi
+  fi
+
+  # 安装依赖
+  if [[ -f "${INSTALL_DIR}/package.json" ]]; then
+    if [[ -d "${INSTALL_DIR}/node_modules" ]]; then
+      log_info "已存在 node_modules，跳过依赖安装"
+    else
+      log_info "安装 npm 依赖..."
+      (cd "${INSTALL_DIR}" && ${SUDO} npm install --omit=dev --silent 2>&1 | tail -5)
+      log_ok "依赖安装完成"
+    fi
   fi
 }
 

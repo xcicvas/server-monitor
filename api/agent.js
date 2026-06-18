@@ -192,24 +192,24 @@ function getNetworkInfo() {
 }
 
 async function getDiskInfo() {
-  // 优先用 df（Linux/macOS 通用），失败时回退 Node.js fs.statfs
+  // 用 df -k（Linux/macOS 通用，单位 KB），乘 1024 转字节
   try {
-    // -B 1 以字节为单位（Linux）。macOS 的 df 默认以 512 字节为单位，另处理
-    const stdout = await execCmd('df -B 1 -k / 2>/dev/null || df -k / 2>/dev/null', 1500);
+    const stdout = await execCmd('df -k / 2>/dev/null', 1500);
     const lines = String(stdout).split('\n').filter((l) => l.trim().length > 0);
     if (lines.length >= 2) {
       const fields = lines[1].split(/\s+/);
-      // fields: Filesystem Size Used Avail Use% Mounted
-      let totalK = Number(fields[1]);
-      let usedK = Number(fields[2]);
-      let availK = Number(fields[3]);
-      // macOS df -k 以 KB 为单位；Linux df -B 1 以字节为单位但加了 -k 会变 KB
-      // 统一：df -k 输出 KB，乘 1024 转字节
-      if (!Number.isFinite(totalK) || totalK <= 0) throw new Error('bad df');
-      const total = totalK * 1024;
-      const used = usedK * 1024;
-      const free = availK * 1024;
-      return { total, used, free, usagePercent: (used / total) * 100 };
+      // fields: Filesystem Size(KB) Used(KB) Avail(KB) Use% Mounted
+      const totalK = Number(fields[1]);
+      const usedK = Number(fields[2]);
+      const availK = Number(fields[3]);
+      if (Number.isFinite(totalK) && totalK > 0) {
+        return {
+          total: totalK * 1024,
+          used: usedK * 1024,
+          free: availK * 1024,
+          usagePercent: (usedK / totalK) * 100,
+        };
+      }
     }
   } catch {}
   // 回退：fs.statfs（Node v19+ 支持）
@@ -228,6 +228,9 @@ async function getDiskInfo() {
   return { total, used, free: total - used, usagePercent: 50 };
 }
 
+// 磁盘 I/O 状态（用于差分计算速率）
+let lastDiskIO = { readBytes: 0, writeBytes: 0, ts: 0 };
+
 function getDiskIO() {
   // 读 /proc/diskstats（Linux），失败则返回零结构
   let readSectors = 0;
@@ -238,7 +241,6 @@ function getDiskIO() {
       const lines = raw.split('\n').filter(Boolean);
       for (const line of lines) {
         const fields = line.trim().split(/\s+/);
-        // 只聚合物理设备（major 8 / 253 / 254 等），跳过分区与循环设备
         const major = Number(fields[0]);
         if (!Number.isFinite(major)) continue;
         const name = fields[2] || '';
@@ -254,12 +256,27 @@ function getDiskIO() {
   // 512 字节/扇区 → 字节
   const readBytes = readSectors * 512;
   const writeBytes = writeSectors * 512;
-  // 速率（简单：当前累计值，不做差分以避免额外状态）
+  const now = Date.now();
+
+  // 差分计算速率（MB/s）
+  let readMbps = 0;
+  let writeMbps = 0;
+  if (lastDiskIO.ts > 0 && now > lastDiskIO.ts) {
+    const dt = (now - lastDiskIO.ts) / 1000; // 秒
+    if (dt > 0 && readBytes >= lastDiskIO.readBytes) {
+      readMbps = ((readBytes - lastDiskIO.readBytes) / (1024 * 1024)) / dt;
+    }
+    if (dt > 0 && writeBytes >= lastDiskIO.writeBytes) {
+      writeMbps = ((writeBytes - lastDiskIO.writeBytes) / (1024 * 1024)) / dt;
+    }
+  }
+  lastDiskIO = { readBytes, writeBytes, ts: now };
+
   return {
     readBytes,
     writeBytes,
-    readMbps: 0,
-    writeMbps: 0,
+    readMbps: Number(readMbps.toFixed(3)),
+    writeMbps: Number(writeMbps.toFixed(3)),
   };
 }
 
@@ -362,25 +379,54 @@ async function getProcessList() {
   }];
 }
 
-// ─── 历史记录存储 ─────────────────────────────────────────────────────────
+// ─── 历史记录存储（内存缓存 + 异步持久化，避免每 10 秒全量读写磁盘）
 const HISTORY_FILE = path.join(HISTORY_DIR, 'metrics_history.json');
-const HISTORY_MAX = 288; // 保留 288 条（约 6 小时，按 80 秒一条算）
+const HISTORY_MAX = 288; // 保留 288 条（约 48 分钟，按 10 秒一条算）
+
+let historyCache = null;
+let historyCacheLoaded = false;
+let historyDirty = false;
 
 function loadHistory() {
+  if (historyCacheLoaded && historyCache) return historyCache.slice();
   try {
     if (fs.existsSync(HISTORY_FILE)) {
-      return JSON.parse(fs.readFileSync(HISTORY_FILE, 'utf-8'));
+      historyCache = JSON.parse(fs.readFileSync(HISTORY_FILE, 'utf-8'));
+      if (!Array.isArray(historyCache)) historyCache = [];
+    } else {
+      historyCache = [];
     }
-  } catch {}
-  return [];
+  } catch {
+    historyCache = [];
+  }
+  historyCacheLoaded = true;
+  return historyCache.slice();
 }
 
 function saveHistoryEntry(entry) {
+  // 写内存缓存
+  if (!historyCacheLoaded) loadHistory();
+  historyCache.push(entry);
+  if (historyCache.length > HISTORY_MAX) historyCache.shift();
+  historyDirty = true;
+}
+
+// 每 30 秒异步落盘一次（不用每次都写）
+setInterval(() => {
+  if (!historyDirty) return;
   try {
-    const history = loadHistory();
-    history.push(entry);
-    if (history.length > HISTORY_MAX) history.shift();
-    fs.writeFileSync(HISTORY_FILE, JSON.stringify(history, null, 2), 'utf-8');
+    const snapshot = historyCache ? historyCache.slice() : [];
+    historyDirty = false;
+    fs.promises.writeFile(HISTORY_FILE, JSON.stringify(snapshot), 'utf-8').catch(() => {});
+  } catch {}
+}, 30_000).unref();
+
+// 进程退出前最后一次写盘
+function flushHistorySync() {
+  if (!historyDirty || !historyCache) return;
+  try {
+    fs.writeFileSync(HISTORY_FILE, JSON.stringify(historyCache), 'utf-8');
+    historyDirty = false;
   } catch {}
 }
 
@@ -658,15 +704,24 @@ function shutdown(signal) {
   console.log(`\n${signal} 收到，正在优雅关闭...`);
   clearInterval(broadcastInterval);
   for (const ws of wsClients) ws.close(1001, 'Server shutting down');
+  flushHistorySync();
   server.close(() => {
     console.log('Agent 已关闭');
     process.exit(0);
   });
-  setTimeout(() => { console.error('强制退出'); process.exit(1); }, 10_000);
+  setTimeout(() => { flushHistorySync(); console.error('强制退出'); process.exit(1); }, 10_000);
 }
 
 process.on('SIGTERM', () => shutdown('SIGTERM'));
 process.on('SIGINT', () => shutdown('SIGINT'));
+process.on('unhandledRejection', (reason) => {
+  console.error('[Unhandled Rejection]', reason);
+});
+process.on('uncaughtException', (err) => {
+  console.error('[Uncaught Exception]', err);
+  try { flushHistorySync(); } catch {}
+  setTimeout(() => process.exit(1), 200);
+});
 
 server.listen(PORT, '0.0.0.0', () => {
   const originHint = STRICT_CORS

@@ -97,13 +97,15 @@
 
 ## 🚀 快速开始
 
-### 环境要求
+> **两个组件，分开部署**：
+> - **面板**（前端 React）：在你的电脑或专门的面板服务器上运行，通过浏览器访问，集中显示所有服务器状态
+> - **Agent**（Node.js）：在**每台被监控的服务器**上运行，负责采集系统指标并通过 WebSocket 推送给面板
+>
+> 👉 `scripts/deploy.sh` **仅用于部署 Agent**，面板需要手动启动
 
-- **Node.js**：20.0 或更高版本
-- **npm**：9.0 或更高版本
-- **Docker**（可选）
+### 第一步：启动面板（本地快速体验）
 
-### 方式一：面板 + 本地 Agent（快速体验）
+在你的电脑或面板服务器上：
 
 ```bash
 # 克隆项目
@@ -115,8 +117,64 @@ npm install
 
 # 启动面板（浏览器访问 http://localhost:5173）
 npm run dev
+```
 
-# 另开终端，启动本地 Agent
+也可以构建生产版本（体积更小，可部署到任意静态服务器）：
+
+```bash
+npm run build
+# 产物在 dist/，用任意静态服务器托管（nginx、Vercel、GitHub Pages 等）
+```
+
+### 第二步：在被监控服务器上运行 Agent
+
+#### 方式 A：一键部署（推荐，无需克隆整个项目）
+
+**在被监控服务器上执行**（只需 agent.js 和 package.json）：
+
+```bash
+# 只下载部署脚本
+curl -fsSL https://raw.githubusercontent.com/xcicvas/server-monitor/main/scripts/deploy.sh -o deploy.sh
+chmod +x deploy.sh
+
+# 全自动部署（自动生成密钥和随机密码）
+sudo ./deploy.sh
+
+# 自定义参数
+sudo ./deploy.sh \
+  -p 7001 \
+  -j my_secret_key \
+  -u admin \
+  -w MyStr0ngPass \
+  -o http://你的面板地址.com
+```
+
+脚本自动完成：检测系统 → 安装 Node.js → 复制 agent.js → 装依赖 → 配置账号 → 注册 systemd → 开放防火墙。
+
+#### 方式 B：Docker 部署 Agent
+
+```bash
+docker run -d \
+  --name server-monitor-agent \
+  --restart unless-stopped \
+  -p 7001:7001 \
+  -e JWT_SECRET=你的强密钥 \
+  -e ADMIN_USERNAME=admin \
+  -e ADMIN_PASSWORD=你的强密码 \
+  -e ALLOWED_ORIGINS=http://localhost:5173 \
+  -v $(pwd)/data:/app/data \
+  node:20-alpine \
+  sh -c "cd /app && npm install express helmet cors ws jsonwebtoken bcryptjs --omit=dev --silent && node agent.js"
+```
+
+> 或者用仓库自带的 `docker-compose.yml`（包含 agent + panel 两个容器）
+
+#### 方式 C：本地直接运行（最简单，适合测试）
+
+```bash
+git clone https://github.com/xcicvas/server-monitor.git
+cd server-monitor
+npm install
 node api/agent.js
 ```
 
@@ -144,52 +202,32 @@ Agent 启动后会显示：
 ⚠️  警告：正在使用默认账号 admin/admin，登录后请立即修改密码
 ```
 
-面板打开后，点击「添加服务器」：
-- **地址**：`http://localhost:7001`
-- **用户名**：`admin`
-- **密码**：`admin`（首次登录后立即修改）
+### 第三步：在面板中添加服务器
 
-### 方式二：一键部署 Agent 到远程服务器
+1. 打开面板 http://localhost:5173
+2. 点击「添加服务器」
+3. 填写：
+   - **服务器名称**：如 `生产环境-北京`
+   - **Agent 地址**：如 `http://192.168.1.100:7001`（必须包含协议头）
+   - **用户名**：`admin`
+   - **密码**：部署 Agent 时设置的密码
+4. 点击「探测」确认连接，然后「添加」
 
-```bash
-# 只下载部署脚本（推荐，无需克隆整个项目）
-curl -fsSL https://raw.githubusercontent.com/xcicvas/server-monitor/main/scripts/deploy.sh -o deploy.sh
-chmod +x deploy.sh
+添加成功后卡片立即显示该服务器的实时指标。
 
-# 全自动部署（自动生成密钥和随机密码）
-sudo ./deploy.sh
-
-# 自定义参数
-sudo ./deploy.sh \
-  -p 7001 \
-  -j my_secret_key \
-  -u admin \
-  -w MyStr0ngPass \
-  -o http://你的面板地址.com
-```
-
-脚本自动完成：检测系统 → 安装 Node.js → 复制文件 → 配置账号 → 注册 systemd → 开放防火墙。
-
-### 方式三：Docker 部署
+### 第四步（必做）：修改默认密码
 
 ```bash
-# 克隆项目
-git clone https://github.com/xcicvas/server-monitor.git
-cd server-monitor
+# 1. 登录获取 JWT
+TOKEN=$(curl -s -X POST http://AgentIP:7001/api/auth/login \
+  -H "Content-Type: application/json" \
+  -d '{"username":"admin","password":"默认密码"}' | jq -r '.token')
 
-# 启动（Agent + 面板）
-docker-compose up -d
-
-# 仅启动 Agent（自定义参数）
-docker run -d \
-  --name server-monitor-agent \
-  -p 7001:7001 \
-  -e JWT_SECRET=你的强密钥 \
-  -e ADMIN_USERNAME=admin \
-  -e ADMIN_PASSWORD=你的强密码 \
-  -e ALLOWED_ORIGINS=http://localhost:5173 \
-  -v $(pwd)/data:/app/data \
-  xcicvas/server-monitor-agent
+# 2. 修改密码
+curl -X POST http://AgentIP:7001/api/auth/change-password \
+  -H "Content-Type: application/json" \
+  -H "Authorization: Bearer $TOKEN" \
+  -d '{"oldPassword":"默认密码","newPassword":"新密码（至少8位）"}'
 ```
 
 ---

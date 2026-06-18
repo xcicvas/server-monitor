@@ -2,6 +2,7 @@ import express from 'express';
 import os from 'node:os';
 import cors from 'cors';
 import helmet from 'helmet';
+import { createServer } from 'node:http';
 
 const PORT = Number(process.env.AGENT_PORT) || 7001;
 
@@ -25,6 +26,9 @@ const RATE_LIMIT_MAX = 60;
 
 // 请求体大小限制
 const MAX_BODY_SIZE = '10kb';
+
+// 请求超时（毫秒）
+const REQUEST_TIMEOUT_MS = 5000;
 
 // ─── 限速（滑动窗口） ────────────────────────────────────────────────────────
 const rateLimitMap = new Map(); // ip → { count: number[], resetTime: number }
@@ -72,6 +76,20 @@ function authMiddleware(req, res, next) {
   if (token !== AUTH_TOKEN) {
     return res.status(403).json({ ok: false, error: '令牌无效' });
   }
+  next();
+}
+
+// ─── 请求超时中间件 ─────────────────────────────────────────────────────────
+function timeoutMiddleware(req, res, next) {
+  if (!AUTH_TOKEN) return next(); // 无令牌模式不超时
+  const timer = setTimeout(() => {
+    if (!res.writableEnded) {
+      res.set('Connection', 'close');
+      res.status(408).json({ ok: false, error: '请求超时' });
+    }
+  }, REQUEST_TIMEOUT_MS);
+  res.on('finish', () => clearTimeout(timer));
+  res.on('close', () => clearTimeout(timer));
   next();
 }
 
@@ -191,8 +209,8 @@ if (STRICT_CORS) {
 // 强制去掉 X-Powered-By 等指纹头
 app.disable('x-powered-by');
 
-// 所有 API 先过认证 + 限速
-app.use('/api', rateLimitMiddleware, authMiddleware);
+// 所有 API 先过认证 + 限速 + 超时
+app.use('/api', rateLimitMiddleware, authMiddleware, timeoutMiddleware);
 
 // ─── API 路由 ────────────────────────────────────────────────────────────────
 
@@ -230,13 +248,34 @@ app.use((err, _req, res, _next) => {
 
 // ─── 启动 ───────────────────────────────────────────────────────────────────
 
-app.listen(PORT, '0.0.0.0', () => {
+const server = createServer(app);
+
+function shutdown(signal) {
+  console.log(`\n${signal} 收到，正在优雅关闭...`);
+  server.close(() => {
+    console.log('Agent 已关闭');
+    process.exit(0);
+  });
+  // 强制退出（10秒后）
+  setTimeout(() => {
+    console.error('强制退出');
+    process.exit(1);
+  }, 10_000);
+}
+
+process.on('SIGTERM', () => shutdown('SIGTERM'));
+process.on('SIGINT', () => shutdown('SIGINT'));
+
+server.listen(PORT, '0.0.0.0', () => {
   const tokenHint = AUTH_TOKEN
     ? `✅ 已配置 (${AUTH_TOKEN.slice(0, 4)}...${AUTH_TOKEN.slice(-4)})`
     : '❌ 未配置 — 强烈建议生产环境设置！';
   const originHint = STRICT_CORS
     ? `✅ 仅允许 ${ALLOWED_ORIGINS.length} 个来源`
     : '⚠️ 未限制来源（建议内网使用）';
+  const timeoutHint = AUTH_TOKEN
+    ? `✅ ${REQUEST_TIMEOUT_MS / 1000}秒`
+    : '—（无令牌模式）';
 
   console.log(`
 ╔══════════════════════════════════════════════════════════╗
@@ -245,8 +284,9 @@ app.listen(PORT, '0.0.0.0', () => {
 ║  端口:      ${String(PORT).padEnd(43)}║
 ║  令牌:      ${tokenHint.padEnd(43)}║
 ║  CORS:      ${originHint.padEnd(43)}║
-║  安全头:    ✅ Helmet 已启用                               ║
+║  安全头:    ✅ Helmet 已启用                             ║
 ║  限速:      ✅ ${RATE_LIMIT_MAX}次/${RATE_LIMIT_WINDOW_MS / 1000}秒（令牌模式）                ║
+║  超时:      ${timeoutHint.padEnd(43)}║
 ╠══════════════════════════════════════════════════════════╣
 ║  API:      http://localhost:${PORT}/api/metrics            ║
 ║  Health:   http://localhost:${PORT}/api/health              ║

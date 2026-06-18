@@ -19,7 +19,7 @@ function deobfuscate(str: string): string {
   }
 }
 
-const sessionStorage_ = createJSONStorage(() => sessionStorage);
+const localStorage_ = createJSONStorage(() => localStorage);
 
 // ─── 历史数据内存 Store（不持久化）────────────────────────────────────────
 const HISTORY_MAX = 30;
@@ -177,7 +177,7 @@ export const useServerStore = create<ServerStore>()(
     }),
     {
       name: 'server-monitor-storage',
-      storage: sessionStorage_, // 使用 sessionStorage 而非 localStorage
+      storage: localStorage_, // 使用 localStorage 持久化配置
       // 只持久化 servers 数组，不包含其他状态
       partialize: (state) => ({ servers: state.servers }),
       // 读取时对 token 去混淆

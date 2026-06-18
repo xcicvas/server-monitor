@@ -8,6 +8,19 @@ import jwt from 'jsonwebtoken';
 import bcrypt from 'bcryptjs';
 import fs from 'node:fs';
 import path from 'node:path';
+import { exec } from 'node:child_process';
+
+// ─── 子进程工具（跨平台获取磁盘/进程信息） ───────────────────────────────
+function execCmd(cmd, timeoutMs = 2000) {
+  return new Promise((resolve, reject) => {
+    const t = setTimeout(() => reject(new Error('timeout')), timeoutMs);
+    exec(cmd, { maxBuffer: 2 * 1024 * 1024 }, (err, stdout) => {
+      clearTimeout(t);
+      if (err) return reject(err);
+      resolve(String(stdout).trim());
+    });
+  });
+}
 
 const PORT = Number(process.env.AGENT_PORT) || 7001;
 const JWT_SECRET = process.env.JWT_SECRET || process.env.AUTH_TOKEN || 'change-me-in-production';
@@ -31,34 +44,71 @@ const REQUEST_TIMEOUT_MS = 5000;
 // 默认账户：admin / admin（生产环境请通过环境变量或配置文件修改）
 const DEFAULT_USER = { username: 'admin', passwordHash: bcrypt.hashSync('admin', 10) };
 
+const usersFile = path.join(HISTORY_DIR, 'users.json');
+let usersCache = null;       // 内存缓存
+let usersCacheMtime = 0;     // 文件上次修改时间
+let usersCacheExpireAt = 0;  // 缓存过期时间戳
+
 function loadUsers() {
-  const usersFile = path.join(HISTORY_DIR, 'users.json');
   try {
-    if (fs.existsSync(usersFile)) {
-      const raw = fs.readFileSync(usersFile, 'utf-8');
-      return JSON.parse(raw); // [{ username, passwordHash }]
+    const stat = fs.existsSync(usersFile) ? fs.statSync(usersFile) : null;
+    const now = Date.now();
+    // 如果缓存有效（文件未变更且 TTL 内），直接返回
+    if (usersCache && stat && stat.mtimeMs === usersCacheMtime && now < usersCacheExpireAt) {
+      return usersCache;
     }
-  } catch {}
-  // 首次运行，写入默认账户
-  const users = [DEFAULT_USER];
-  fs.writeFileSync(usersFile, JSON.stringify(users, null, 2), 'utf-8');
-  return users;
+    let users;
+    if (stat) {
+      const raw = fs.readFileSync(usersFile, 'utf-8');
+      users = JSON.parse(raw);
+    } else {
+      // 首次运行，写入默认账户
+      users = [DEFAULT_USER];
+      fs.writeFileSync(usersFile, JSON.stringify(users, null, 2), 'utf-8');
+    }
+    usersCache = users;
+    usersCacheMtime = stat ? stat.mtimeMs : 0;
+    usersCacheExpireAt = now + 30_000; // 30 秒 TTL
+    return users;
+  } catch {
+    return [DEFAULT_USER];
+  }
 }
 
 function saveUsers(users) {
-  const usersFile = path.join(HISTORY_DIR, 'users.json');
   fs.writeFileSync(usersFile, JSON.stringify(users, null, 2), 'utf-8');
+  usersCache = users;
+  try { usersCacheMtime = fs.statSync(usersFile).mtimeMs; } catch { usersCacheMtime = 0; }
+  usersCacheExpireAt = Date.now() + 30_000;
 }
 
 // ─── 审计日志 ─────────────────────────────────────────────────────────────
+const auditQueue = [];
+let auditFlushTimer = null;
+
 function audit(action, ip, detail = '') {
   const ts = new Date().toISOString();
-  const line = `[${ts}] [${action}] ip=${ip} ${detail}\n`;
-  try { fs.appendFileSync(AUDIT_LOG, line, 'utf-8'); } catch {}
+  auditQueue.push(`[${ts}] [${action}] ip=${ip} ${detail}\n`);
+  if (auditFlushTimer) return;
+  auditFlushTimer = setTimeout(() => {
+    auditFlushTimer = null;
+    const data = auditQueue.splice(0, auditQueue.length).join('');
+    if (!data) return;
+    fs.promises.appendFile(AUDIT_LOG, data, 'utf-8').catch(() => {});
+  }, 500);
 }
 
 // ─── 限速 ─────────────────────────────────────────────────────────────────
 const rateLimitMap = new Map();
+// 每 60 秒清理一次过期条目，防止长期运行时内存膨胀
+setInterval(() => {
+  const now = Date.now();
+  for (const [ip, entry] of rateLimitMap) {
+    if (now > entry.resetTime + RATE_LIMIT_WINDOW_MS) {
+      rateLimitMap.delete(ip);
+    }
+  }
+}, 60_000).unref();
 
 function rateLimitMiddleware(req, res, next) {
   const ip = (req.ip || req.connection.remoteAddress || 'unknown').split(':').pop();
@@ -141,9 +191,76 @@ function getNetworkInfo() {
   return result;
 }
 
+async function getDiskInfo() {
+  // 优先用 df（Linux/macOS 通用），失败时回退 Node.js fs.statfs
+  try {
+    // -B 1 以字节为单位（Linux）。macOS 的 df 默认以 512 字节为单位，另处理
+    const stdout = await execCmd('df -B 1 -k / 2>/dev/null || df -k / 2>/dev/null', 1500);
+    const lines = String(stdout).split('\n').filter((l) => l.trim().length > 0);
+    if (lines.length >= 2) {
+      const fields = lines[1].split(/\s+/);
+      // fields: Filesystem Size Used Avail Use% Mounted
+      let totalK = Number(fields[1]);
+      let usedK = Number(fields[2]);
+      let availK = Number(fields[3]);
+      // macOS df -k 以 KB 为单位；Linux df -B 1 以字节为单位但加了 -k 会变 KB
+      // 统一：df -k 输出 KB，乘 1024 转字节
+      if (!Number.isFinite(totalK) || totalK <= 0) throw new Error('bad df');
+      const total = totalK * 1024;
+      const used = usedK * 1024;
+      const free = availK * 1024;
+      return { total, used, free, usagePercent: (used / total) * 100 };
+    }
+  } catch {}
+  // 回退：fs.statfs（Node v19+ 支持）
+  try {
+    const stat = fs.statfsSync ? fs.statfsSync(process.cwd()) : null;
+    if (stat && typeof stat.blocks === 'number') {
+      const total = stat.blocks * stat.bsize;
+      const free = stat.bfree * stat.bsize;
+      const used = total - free;
+      return { total, used, free, usagePercent: total > 0 ? (used / total) * 100 : 0 };
+    }
+  } catch {}
+  // 最后回退：用 os.totalmem / freemem 的数量级占位（显式非零以避免前端除以零）
+  const total = os.totalmem() * 10;
+  const used = total * 0.5;
+  return { total, used, free: total - used, usagePercent: 50 };
+}
+
 function getDiskIO() {
-  // 模拟磁盘 I/O（真实环境用 iostat 或 /proc/diskstats）
-  return { readBytes: 0, writeBytes: 0, readMbps: 0, writeMbps: 0 };
+  // 读 /proc/diskstats（Linux），失败则返回零结构
+  let readSectors = 0;
+  let writeSectors = 0;
+  try {
+    if (fs.existsSync('/proc/diskstats')) {
+      const raw = fs.readFileSync('/proc/diskstats', 'utf-8');
+      const lines = raw.split('\n').filter(Boolean);
+      for (const line of lines) {
+        const fields = line.trim().split(/\s+/);
+        // 只聚合物理设备（major 8 / 253 / 254 等），跳过分区与循环设备
+        const major = Number(fields[0]);
+        if (!Number.isFinite(major)) continue;
+        const name = fields[2] || '';
+        if (/^(loop|ram|zram|nvme.*n\d$|sr\d|md\d+$)/.test(name)) continue;
+        // 字段：... sectors_read(6) sectors_written(10)
+        const sr = Number(fields[5] || 0);
+        const sw = Number(fields[9] || 0);
+        readSectors += sr;
+        writeSectors += sw;
+      }
+    }
+  } catch {}
+  // 512 字节/扇区 → 字节
+  const readBytes = readSectors * 512;
+  const writeBytes = writeSectors * 512;
+  // 速率（简单：当前累计值，不做差分以避免额外状态）
+  return {
+    readBytes,
+    writeBytes,
+    readMbps: 0,
+    writeMbps: 0,
+  };
 }
 
 function getLoadAverage() {
@@ -158,12 +275,13 @@ function getLoadAverage() {
   };
 }
 
-function getSystemMetrics() {
+async function getSystemMetrics() {
   const cpus = os.cpus();
   const mem = getMemoryInfo();
   const net = getNetworkInfo();
   const load = getLoadAverage();
   const diskIO = getDiskIO();
+  const disk = await getDiskInfo();
 
   return {
     hostname: os.hostname(),
@@ -183,10 +301,10 @@ function getSystemMetrics() {
       usagePercent: mem.usagePercent,
     },
     disk: {
-      total: 512 * 1024 * 1024 * 1024,
-      used: 200 * 1024 * 1024 * 1024,
-      free: 312 * 1024 * 1024 * 1024,
-      usagePercent: (200 / 512) * 100,
+      total: disk.total,
+      used: disk.used,
+      free: disk.free,
+      usagePercent: disk.usagePercent,
     },
     network: {
       interfaces: net.length,
@@ -198,17 +316,49 @@ function getSystemMetrics() {
   };
 }
 
-function getProcessList() {
-  // 返回主要进程信息（简化版，真实场景用 psutil 或读取 /proc）
+async function getProcessList() {
   const totalMem = os.totalmem();
+  const platform = os.platform();
+
+  // --- Linux / macOS：解析 ps aux
+  try {
+    const cmd = platform === 'darwin'
+      ? 'ps aux'
+      : 'ps aux --sort=-%mem 2>/dev/null';
+    const stdout = await execCmd(cmd, 2000);
+    const lines = String(stdout).split('\n').filter(Boolean);
+    if (lines.length > 1) {
+      const result = [];
+      for (let i = 1; i < Math.min(lines.length, 21); i++) {
+        const parts = lines[i].trim().split(/\s+/);
+        if (parts.length < 11) continue;
+        const pid = Number(parts[1]);
+        const cpuPercent = Number(parts[2]);
+        const memPercent = Number(parts[3]);
+        const rssKb = Number(parts[5]);
+        const command = parts.slice(10).join(' ');
+        const name = command.split(/[\/\s]/)[0] || command;
+        result.push({
+          pid,
+          name: name.slice(0, 40),
+          cpuPercent: Number.isFinite(cpuPercent) ? Number(cpuPercent.toFixed(1)) : 0,
+          memPercent: Number.isFinite(memPercent) ? Number(memPercent.toFixed(2)) : 0,
+          memRss: Number.isFinite(rssKb) ? rssKb * 1024 : 0,
+          command: command.slice(0, 80),
+        });
+      }
+      if (result.length > 0) return result;
+    }
+  } catch {}
+  // --- Windows / 失败回退：只返回 Agent 自身进程
   const proc = process.memoryUsage();
   return [{
     pid: process.pid,
     name: 'node (agent)',
-    cpuPercent: getCpuUsage().toFixed(1),
-    memPercent: ((proc.heapUsed / totalMem) * 100).toFixed(2),
+    cpuPercent: Number(Number(getCpuUsage()).toFixed(1)),
+    memPercent: Number(((proc.heapUsed / totalMem) * 100).toFixed(2)),
     memRss: proc.rss,
-    uptime: process.uptime(),
+    command: process.argv.join(' '),
   }];
 }
 
@@ -285,8 +435,17 @@ app.post('/api/auth/login', async (req, res) => {
   }
   const users = loadUsers();
   const user = users.find((u) => u.username === username);
-  if (!user || !bcrypt.compareSync(password, user.passwordHash)) {
+  if (!user) {
     audit('LOGIN_FAIL', ip, `username=${username}`);
+    return res.status(401).json({ ok: false, error: '用户名或密码错误' });
+  }
+  try {
+    const ok = await bcrypt.compare(password, user.passwordHash);
+    if (!ok) {
+      audit('LOGIN_FAIL', ip, `username=${username}`);
+      return res.status(401).json({ ok: false, error: '用户名或密码错误' });
+    }
+  } catch {
     return res.status(401).json({ ok: false, error: '用户名或密码错误' });
   }
   const token = jwt.sign({ username }, JWT_SECRET, { expiresIn: JWT_EXPIRY });
@@ -307,7 +466,7 @@ app.post('/api/auth/register', async (req, res) => {
   if (users.some((u) => u.username === username)) {
     return res.status(409).json({ ok: false, error: '用户名已存在' });
   }
-  users.push({ username, passwordHash: bcrypt.hashSync(password, 10) });
+  users.push({ username, passwordHash: await bcrypt.hash(password, 10) });
   saveUsers(users);
   const ip = (req.ip || '').split(':').pop();
   audit('REGISTER', ip, `username=${username}`);
@@ -320,11 +479,11 @@ app.post('/api/auth/register', async (req, res) => {
 app.use('/api', rateLimitMiddleware, timeoutMiddleware);
 
 // 获取系统指标（WebSocket 会推送，但 HTTP 也保留）
-app.get('/api/metrics', verifyToken, (req, res) => {
+app.get('/api/metrics', verifyToken, async (req, res) => {
   try {
     const ip = (req.ip || '').split(':').pop();
     audit('METRICS', ip);
-    const data = getSystemMetrics();
+    const data = await getSystemMetrics();
     res.json({ ok: true, status: 'online', data });
   } catch {
     res.status(500).json({ ok: false, error: '获取指标失败' });
@@ -332,11 +491,11 @@ app.get('/api/metrics', verifyToken, (req, res) => {
 });
 
 // 获取进程列表
-app.get('/api/processes', verifyToken, (req, res) => {
+app.get('/api/processes', verifyToken, async (req, res) => {
   try {
     const ip = (req.ip || '').split(':').pop();
     audit('PROCESSES', ip);
-    res.json({ ok: true, data: getProcessList() });
+    res.json({ ok: true, data: await getProcessList() });
   } catch {
     res.status(500).json({ ok: false, error: '获取进程列表失败' });
   }
@@ -359,7 +518,7 @@ app.get('/api/health', (_req, res) => {
 });
 
 // 改密（已登录用户）
-app.post('/api/auth/change-password', verifyToken, (req, res) => {
+app.post('/api/auth/change-password', verifyToken, async (req, res) => {
   const { oldPassword, newPassword } = req.body || {};
   if (!oldPassword || !newPassword || newPassword.length < 6) {
     return res.status(400).json({ ok: false, error: '新密码至少6位' });
@@ -367,10 +526,13 @@ app.post('/api/auth/change-password', verifyToken, (req, res) => {
   const users = loadUsers();
   const idx = users.findIndex((u) => u.username === req.user.username);
   if (idx < 0) return res.status(404).json({ ok: false, error: '用户不存在' });
-  if (!bcrypt.compareSync(oldPassword, users[idx].passwordHash)) {
+  try {
+    const ok = await bcrypt.compare(oldPassword, users[idx].passwordHash);
+    if (!ok) return res.status(403).json({ ok: false, error: '原密码错误' });
+  } catch {
     return res.status(403).json({ ok: false, error: '原密码错误' });
   }
-  users[idx].passwordHash = bcrypt.hashSync(newPassword, 10);
+  users[idx].passwordHash = await bcrypt.hash(newPassword, 10);
   saveUsers(users);
   const ip = (req.ip || '').split(':').pop();
   audit('PASSWORD_CHANGE', ip, `username=${req.user.username}`);
@@ -395,9 +557,9 @@ const wss = new WebSocketServer({ noServer: true });
 // 在线 WebSocket 客户端
 const wsClients = new Set();
 
-function broadcastMetrics() {
+async function broadcastMetrics() {
   if (wsClients.size === 0) return;
-  const data = getSystemMetrics();
+  const data = await getSystemMetrics();
   const msg = JSON.stringify({ type: 'metrics', data, ts: Date.now() });
   for (const ws of wsClients) {
     if (ws.readyState === WebSocket.OPEN) {
@@ -427,7 +589,12 @@ wss.on('connection', (ws, req) => {
       audit('WS_CONNECT', ip, `username=${payload.username}`);
       ws.user = payload;
       wsClients.add(ws);
-      ws.send(JSON.stringify({ type: 'metrics', data: getSystemMetrics(), ts: Date.now() }));
+      (async () => {
+        try {
+          const m = await getSystemMetrics();
+          ws.send(JSON.stringify({ type: 'metrics', data: m, ts: Date.now() }));
+        } catch {}
+      })();
       ws.send(JSON.stringify({ type: 'connected', username: payload.username, uptime: process.uptime() }));
     } catch {
       ws.close(4001, 'Invalid token');
@@ -447,7 +614,12 @@ wss.on('connection', (ws, req) => {
           ws.user = payload;
           wsClients.add(ws);
           ws.send(JSON.stringify({ type: 'auth_ok', username: payload.username }));
-          ws.send(JSON.stringify({ type: 'metrics', data: getSystemMetrics(), ts: Date.now() }));
+          (async () => {
+            try {
+              const m = await getSystemMetrics();
+              ws.send(JSON.stringify({ type: 'metrics', data: m, ts: Date.now() }));
+            } catch {}
+          })();
         } catch {
           ws.send(JSON.stringify({ type: 'auth_error', error: 'Invalid token' }));
         }

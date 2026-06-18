@@ -1,5 +1,6 @@
 import { useState } from 'react';
-import { X, Server, Terminal, Loader, AlertCircle } from 'lucide-react';
+import { X, Server, Terminal, Loader, AlertCircle, CheckCircle2, Wifi } from 'lucide-react';
+import { probeAgent, loginAgent } from '../utils/probeAgent';
 
 interface AddServerModalProps {
   isOpen: boolean;
@@ -14,42 +15,11 @@ interface AddServerModalProps {
   }) => void;
 }
 
-const PRIVATE_IP_RE = /^(127\.|10\.|172\.(1[6-9]|2[0-9]|3[0-1])\.|192\.168\.|0\.|169\.254\.|localhost|::1|fe80|::ffff:)/i;
-
-function isPrivateIp(ip: string): boolean {
-  if (!ip) return false;
-  ip = ip.toLowerCase();
-  if (PRIVATE_IP_RE.test(ip)) return true;
-  const parts = ip.split('.').map(Number);
-  if (parts.length === 4 && !isNaN(parts[0])) {
-    if (parts[0] === 0) return true;
-    if (parts[0] === 10) return true;
-    if (parts[0] === 127) return true;
-    if (parts[0] === 169 && parts[1] === 254) return true;
-    if (parts[0] === 172 && parts[1] >= 16 && parts[1] <= 31) return true;
-    if (parts[0] === 192 && parts[1] === 168) return true;
+function normalizeAddress(address: string): string {
+  if (!/^https?:\/\//i.test(address)) {
+    return `http://${address.trim()}`;
   }
-  return false;
-}
-
-async function checkSSRF(address: string): Promise<boolean> {
-  try {
-    const urlStr = /^https?:\/\//i.test(address) ? address : `http://${address}`;
-    const u = new URL(urlStr);
-    if (isPrivateIp(u.hostname)) return true;
-    try {
-      const addr = await fetch(`https://dns.google/resolve?name=${encodeURIComponent(u.hostname)}&type=A`);
-      const data = await addr.json();
-      if (data.Answer) {
-        for (const ans of data.Answer) {
-          if (ans.data && isPrivateIp(ans.data)) return true;
-        }
-      }
-    } catch {}
-    return false;
-  } catch {
-    return true;
-  }
+  return address.trim();
 }
 
 export function AddServerModal({ isOpen, onClose, onAdd }: AddServerModalProps) {
@@ -57,80 +27,92 @@ export function AddServerModal({ isOpen, onClose, onAdd }: AddServerModalProps) 
   const [address, setAddress] = useState('');
   const [username, setUsername] = useState('');
   const [password, setPassword] = useState('');
-  const [interval, setInterval] = useState(5);
   const [errors, setErrors] = useState<Record<string, string>>({});
   const [loginError, setLoginError] = useState('');
   const [loading, setLoading] = useState(false);
+  const [probeResult, setProbeResult] = useState<{
+    health: boolean;
+    latency: number | null;
+    hostname?: string;
+    platform?: string;
+  } | null>(null);
+  const [probeState, setProbeState] = useState<'idle' | 'checking'>('idle');
 
   function reset() {
     setName('');
     setAddress('');
     setUsername('');
     setPassword('');
-    setInterval(5);
     setErrors({});
     setLoginError('');
     setLoading(false);
+    setProbeResult(null);
+    setProbeState('idle');
   }
 
   if (!isOpen) return null;
 
-  const validateBasic = () => {
+  const validate = () => {
     const e: Record<string, string> = {};
     if (!name.trim()) e.name = '请输入服务器名称';
     if (!address.trim()) {
       e.address = '请输入 Agent 地址';
     } else {
-      const normalized = /^https?:\/\//i.test(address.trim())
-        ? address.trim()
-        : `http://${address.trim()}`;
-      try { new URL(normalized); } catch { e.address = '地址格式不正确'; }
+      try {
+        new URL(normalizeAddress(address));
+      } catch {
+        e.address = '地址格式不正确';
+      }
     }
-    if (interval < 1 || interval > 300) e.interval = '刷新间隔需在 1-300 秒之间';
+    if (!username.trim()) e.username = '请输入用户名';
+    if (!password) e.password = '请输入密码';
     setErrors(e);
     return Object.keys(e).length === 0;
   };
 
+  const handleProbe = async () => {
+    if (!address.trim()) return;
+    setProbeState('checking');
+    setProbeResult(null);
+    const result = await probeAgent(address.trim());
+    setProbeState('idle');
+    setProbeResult({
+      health: result.health,
+      latency: result.latency,
+      hostname: result.info?.hostname,
+      platform: result.info?.platform,
+    });
+  };
+
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
-    if (!validateBasic()) return;
+    if (!validate()) return;
 
-    const urlStr = /^https?:\/\//i.test(address.trim()) ? address.trim() : `http://${address.trim()}`;
+    const urlStr = normalizeAddress(address);
 
     setLoading(true);
     setLoginError('');
 
     try {
-      const isPrivate = await checkSSRF(address.trim());
-      if (isPrivate) {
-        setErrors({ address: '不支持内网 IP 地址，请使用公网可访问的 Agent 地址' });
+      const login = await loginAgent(urlStr, username, password);
+
+      if (!login.ok) {
+        setLoginError(login.error || '登录失败，请检查用户名和密码');
         setLoading(false);
         return;
       }
 
-      const resp = await fetch(`${urlStr}/api/auth/login`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ username: username.trim(), password }),
-      });
-      const data = await resp.json();
-      if (!resp.ok || !data.ok) {
-        setLoginError(data.error || '登录失败，请检查用户名和密码');
-        setLoading(false);
-        return;
-      }
-      // 登录成功，添加到列表
       onAdd({
         name: name.trim(),
         address: urlStr,
-        token: data.token,
+        token: login.token || '',
         username: username.trim(),
         password: password,
-        interval,
+        interval: 10,
       });
       reset();
       onClose();
-    } catch (err) {
+    } catch {
       setLoginError(`无法连接到 ${urlStr}，请确认 Agent 已启动且地址正确`);
       setLoading(false);
     }
@@ -181,18 +163,49 @@ export function AddServerModal({ isOpen, onClose, onAdd }: AddServerModalProps) 
             <label className="block text-xs font-semibold text-stone-500 uppercase tracking-wider mb-1.5">
               Agent 地址 <span className="text-red-400 normal-case">*</span>
             </label>
-            <input
-              type="text"
-              value={address}
-              onChange={(e) => setAddress(e.target.value)}
-              placeholder="http://服务器IP:7001"
-              className={`input input-mono ${errors.address ? 'input-error' : ''}`}
-              disabled={loading}
-            />
+            <div className="flex gap-2">
+              <input
+                type="text"
+                value={address}
+                onChange={(e) => { setAddress(e.target.value); setProbeResult(null); }}
+                placeholder="http://服务器IP:7001"
+                className={`input input-mono flex-1 ${errors.address ? 'input-error' : ''}`}
+                disabled={loading}
+              />
+              <button
+                type="button"
+                onClick={handleProbe}
+                disabled={loading || probeState === 'checking' || !address.trim()}
+                className="px-3 py-2 rounded-xl bg-stone-100 text-stone-600 text-xs font-medium hover:bg-stone-200 transition-colors disabled:opacity-50 flex items-center gap-1"
+              >
+                <Wifi className="w-3 h-3" strokeWidth={2} />
+                探测
+              </button>
+            </div>
             {errors.address ? (
               <p className="mt-1.5 text-xs text-red-500">{errors.address}</p>
+            ) : probeState === 'checking' ? (
+              <p className="mt-1.5 text-xs text-stone-400 flex items-center gap-1.5">
+                <span className="inline-block w-1.5 h-1.5 rounded-full bg-stone-400 animate-pulse" />
+                正在探测...
+              </p>
+            ) : probeResult ? (
+              <div className={`mt-1.5 flex items-center gap-1.5 text-xs ${probeResult.health ? 'text-emerald-600' : 'text-amber-600'}`}>
+                {probeResult.health ? (
+                  <>
+                    <CheckCircle2 className="w-3 h-3" strokeWidth={2} />
+                    Agent 在线 — {probeResult.latency} ms
+                    {probeResult.hostname && <span className="text-stone-400">· {probeResult.hostname}</span>}
+                  </>
+                ) : (
+                  <>
+                    <AlertCircle className="w-3 h-3" strokeWidth={2} />
+                    无法连接，请确认 Agent 已启动
+                  </>
+                )}
+              </div>
             ) : (
-              <p className="mt-1.5 text-xs text-stone-400">请使用公网可访问的地址</p>
+              <p className="mt-1.5 text-xs text-stone-400">点击「探测」按钮可测试连接</p>
             )}
           </div>
 
@@ -205,10 +218,11 @@ export function AddServerModal({ isOpen, onClose, onAdd }: AddServerModalProps) 
               value={username}
               onChange={(e) => setUsername(e.target.value)}
               placeholder="admin"
-              className="input"
+              className={`input ${errors.username ? 'input-error' : ''}`}
               autoComplete="username"
               disabled={loading}
             />
+            {errors.username && <p className="mt-1.5 text-xs text-red-500">{errors.username}</p>}
           </div>
 
           <div>
@@ -220,48 +234,14 @@ export function AddServerModal({ isOpen, onClose, onAdd }: AddServerModalProps) 
               value={password}
               onChange={(e) => setPassword(e.target.value)}
               placeholder="••••••"
-              className="input"
+              className={`input ${errors.password ? 'input-error' : ''}`}
               autoComplete="current-password"
               disabled={loading}
             />
+            {errors.password && <p className="mt-1.5 text-xs text-red-500">{errors.password}</p>}
             <p className="mt-1.5 text-xs text-stone-400">
               默认：admin / admin（首次登录后请修改密码）
             </p>
-          </div>
-
-          <div>
-            <label className="block text-xs font-semibold text-stone-500 uppercase tracking-wider mb-1.5">
-              刷新间隔
-            </label>
-            <div className="flex items-center gap-2">
-              <input
-                type="number"
-                value={interval}
-                onChange={(e) => setInterval(Number(e.target.value))}
-                min={1}
-                max={300}
-                className={`input input-mono flex-1 ${errors.interval ? 'input-error' : ''}`}
-                disabled={loading}
-              />
-              <div className="flex gap-1">
-                {[3, 5, 10, 30].map((v) => (
-                  <button
-                    key={v}
-                    type="button"
-                    onClick={() => setInterval(v)}
-                    className={`px-2.5 py-1.5 rounded-lg text-xs font-mono font-medium transition-colors
-                      ${interval === v
-                        ? 'bg-stone-800 text-white dark:bg-stone-700'
-                        : 'bg-stone-100 text-stone-500 hover:bg-stone-200'
-                      }`}
-                    disabled={loading}
-                  >
-                    {v}s
-                  </button>
-                ))}
-              </div>
-            </div>
-            {errors.interval && <p className="mt-1.5 text-xs text-red-500">{errors.interval}</p>}
           </div>
 
           {loginError && (

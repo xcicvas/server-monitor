@@ -470,7 +470,25 @@ if (STRICT_CORS) {
 
 app.disable('x-powered-by');
 
+// ─── 全局中间件（限速 + 超时）──────────────────────────────────────────────
+// 所有 /api/* 路由（包括登录、注册、health）都经过限速和超时，防止暴力破解
+app.use('/api', rateLimitMiddleware, timeoutMiddleware);
+
 // ─── 公开路由 ──────────────────────────────────────────────────────────────
+
+// 健康检查（无需认证）— 返回前端探测所需的字段
+app.get('/api/health', (_req, res) => {
+  res.json({
+    ok: true,
+    status: 'online',
+    uptime: process.uptime(),
+    timestamp: Date.now(),
+    hostname: os.hostname(),
+    platform: os.platform(),
+    arch: os.arch(),
+    nodeVersion: process.version,
+  });
+});
 
 // 登录
 app.post('/api/auth/login', async (req, res) => {
@@ -499,8 +517,13 @@ app.post('/api/auth/login', async (req, res) => {
   res.json({ ok: true, token, username });
 });
 
-// 注册（仅当无用户时允许，或通过环境变量禁用）
+// 注册（可通过 DISABLE_REGISTER 环境变量禁用；首次部署建议开启后关闭）
+const DISABLE_REGISTER = process.env.DISABLE_REGISTER === '1' || process.env.DISABLE_REGISTER === 'true';
+
 app.post('/api/auth/register', async (req, res) => {
+  if (DISABLE_REGISTER) {
+    return res.status(403).json({ ok: false, error: '注册功能已禁用' });
+  }
   const { username, password } = req.body || {};
   if (!username || !password) {
     return res.status(400).json({ ok: false, error: '用户名和密码不能为空' });
@@ -521,8 +544,6 @@ app.post('/api/auth/register', async (req, res) => {
 });
 
 // ─── 受保护路由 ────────────────────────────────────────────────────────────
-
-app.use('/api', rateLimitMiddleware, timeoutMiddleware);
 
 // 获取系统指标（WebSocket 会推送，但 HTTP 也保留）
 app.get('/api/metrics', verifyToken, async (req, res) => {
@@ -556,11 +577,6 @@ app.get('/api/history', verifyToken, (req, res) => {
   } catch {
     res.status(500).json({ ok: false, error: '获取历史数据失败' });
   }
-});
-
-// 健康检查（无需认证）
-app.get('/api/health', (_req, res) => {
-  res.json({ ok: true, status: 'online', uptime: process.uptime(), timestamp: Date.now() });
 });
 
 // 改密（已登录用户）

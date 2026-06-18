@@ -1,51 +1,128 @@
 import { create } from 'zustand';
-import { persist } from 'zustand/middleware';
-import { createJSONStorage } from 'zustand/middleware';
+import { persist, createJSONStorage } from 'zustand/middleware';
 
 const STORAGE_KEY = 'server-monitor-storage';
 const HISTORY_KEY = 'server-monitor-history';
 
+// ─── 简易混淆（仅防浏览器 localStorage 直读，非强加密）──────────
+// 设计原则：内存中保持明文，磁盘上保持密文。在 storage 层做加/解密。
 const ENCRYPTION_KEY = 'server-monitor-v2-key';
 
-function deriveKey(key: string): Uint8Array {
-  const hash = new Uint8Array(32);
-  for (let i = 0; i < key.length; i++) {
-    hash[i % 32] ^= key.charCodeAt(i);
+function xorTransform(input: string): string {
+  let out = '';
+  for (let i = 0; i < input.length; i++) {
+    out += String.fromCharCode(input.charCodeAt(i) ^ ENCRYPTION_KEY.charCodeAt(i % ENCRYPTION_KEY.length));
   }
-  return hash;
+  return out;
 }
 
-function encrypt(str: string): string {
+function encryptPlain(plain: string): string {
   try {
-    const key = deriveKey(ENCRYPTION_KEY);
-    const encoder = new TextEncoder();
-    const data = encoder.encode(str);
-    const encrypted = new Uint8Array(data.length);
-    for (let i = 0; i < data.length; i++) {
-      encrypted[i] = data[i] ^ key[i % key.length];
-    }
-    return btoa(String.fromCharCode(...encrypted));
+    // btoa 只能处理 Latin1，UTF-8 需先 encode
+    const utf8 = unescape(encodeURIComponent(plain));
+    return btoa(xorTransform(utf8));
   } catch {
-    return btoa(encodeURIComponent(str));
+    return btoa(unescape(encodeURIComponent(plain)));
   }
 }
 
-function decrypt(str: string): string {
+function decryptPlain(cipher: string): string {
   try {
-    const key = deriveKey(ENCRYPTION_KEY);
-    const bytes = new Uint8Array(atob(str).split('').map(c => c.charCodeAt(0)));
-    const decrypted = new Uint8Array(bytes.length);
-    for (let i = 0; i < bytes.length; i++) {
-      decrypted[i] = bytes[i] ^ key[i % key.length];
-    }
-    return new TextDecoder().decode(decrypted);
+    const utf8 = xorTransform(atob(cipher));
+    return decodeURIComponent(escape(utf8));
   } catch {
+    // 兼容旧数据（明文）
     try {
-      return decodeURIComponent(atob(str));
+      return decodeURIComponent(escape(atob(cipher)));
     } catch {
-      return str;
+      return cipher;
     }
   }
+}
+
+// 只加密敏感字段的序列化层：
+// 写入：JSON.stringify → encrypt sensitive fields → JSON.stringify
+// 读取：JSON.parse → decrypt sensitive fields → return
+function encryptServerFields(obj: unknown): unknown {
+  if (!obj) return obj;
+  if (Array.isArray(obj)) return obj.map(encryptServerFields);
+  if (typeof obj !== 'object') return obj;
+  const out: Record<string, unknown> = {};
+  for (const [k, v] of Object.entries(obj as Record<string, unknown>)) {
+    if (typeof v === 'string' && (k === 'token' || k === 'username' || k === 'password')) {
+      out[k] = v ? `__enc__${encryptPlain(v)}` : v;
+    } else if (Array.isArray(v)) {
+      out[k] = v.map(encryptServerFields);
+    } else if (v && typeof v === 'object') {
+      out[k] = encryptServerFields(v);
+    } else {
+      out[k] = v;
+    }
+  }
+  return out;
+}
+
+function decryptServerFields(obj: unknown): unknown {
+  if (!obj) return obj;
+  if (Array.isArray(obj)) return obj.map(decryptServerFields);
+  if (typeof obj !== 'object') return obj;
+  const out: Record<string, unknown> = {};
+  for (const [k, v] of Object.entries(obj as Record<string, unknown>)) {
+    if (typeof v === 'string' && (k === 'token' || k === 'username' || k === 'password')) {
+      out[k] = v.startsWith('__enc__') ? decryptPlain(v.slice(7)) : v;
+    } else if (Array.isArray(v)) {
+      out[k] = v.map(decryptServerFields);
+    } else if (v && typeof v === 'object') {
+      out[k] = decryptServerFields(v);
+    } else {
+      out[k] = v;
+    }
+  }
+  return out;
+}
+
+interface PersistedStateShape {
+  servers: ServerData[];
+}
+
+interface StorageValueShape {
+  state: PersistedStateShape;
+  version?: number;
+}
+
+function createEncryptedStorage() {
+  return {
+    getItem: (name: string): StorageValueShape | null => {
+      if (typeof localStorage === 'undefined') return null;
+      const str = localStorage.getItem(name);
+      if (!str) return null;
+      try {
+        const parsed: StorageValueShape = JSON.parse(str);
+        if (parsed && typeof parsed === 'object' && 'state' in parsed) {
+          parsed.state = decryptServerFields(parsed.state) as PersistedStateShape;
+        }
+        return parsed;
+      } catch {
+        return null;
+      }
+    },
+    setItem: (name: string, value: StorageValueShape): void => {
+      if (typeof localStorage === 'undefined') return;
+      try {
+        const toWrite: StorageValueShape =
+          value && typeof value === 'object' && 'state' in value
+            ? { ...value, state: encryptServerFields(value.state) as PersistedStateShape }
+            : value;
+        localStorage.setItem(name, JSON.stringify(toWrite));
+      } catch {
+        try { localStorage.setItem(name, JSON.stringify(value)); } catch {}
+      }
+    },
+    removeItem: (name: string): void => {
+      if (typeof localStorage === 'undefined') return;
+      try { localStorage.removeItem(name); } catch {}
+    },
+  };
 }
 
 // ─── 历史数据持久化 ─────────────────────────────────────────────────────────
@@ -169,6 +246,7 @@ export const useServerStore = create<ServerStore>()(
     (set) => ({
       servers: [],
 
+      // 内存中保持明文，storage 层自动加解密敏感字段（token/username/password）
       addServer: ({ name, address, token = '', username = '', password = '', interval }) =>
         set((state) => ({
           servers: [
@@ -176,9 +254,9 @@ export const useServerStore = create<ServerStore>()(
               id: genId(),
               name,
               address,
-              token: token ? encrypt(token) : '',
-              username: username ? encrypt(username) : '',
-              password: password ? encrypt(password) : '',
+              token,
+              username,
+              password,
               interval,
               createdAt: Date.now(),
               status: 'checking',
@@ -198,20 +276,7 @@ export const useServerStore = create<ServerStore>()(
 
       updateServer: (id, updates) =>
         set((state) => ({
-          servers: state.servers.map((s) => {
-            if (s.id !== id) return s;
-            const processed = { ...updates };
-            if (processed.token !== undefined) {
-              processed.token = processed.token ? encrypt(processed.token) : '';
-            }
-            if (processed.username !== undefined) {
-              processed.username = processed.username ? encrypt(processed.username) : '';
-            }
-            if (processed.password !== undefined) {
-              processed.password = processed.password ? encrypt(processed.password) : '';
-            }
-            return { ...s, ...processed };
-          }),
+          servers: state.servers.map((s) => (s.id === id ? { ...s, ...updates } : s)),
         })),
 
       setStatus: (id, status) =>
@@ -252,18 +317,12 @@ export const useServerStore = create<ServerStore>()(
     }),
     {
       name: STORAGE_KEY,
-      storage: createJSONStorage(() => localStorage),
+      // storage 层自动加解密敏感字段：token/username/password
+      // 内存 state 保持明文，便于直接读取/发送；磁盘上始终是混淆形式
+      storage: createEncryptedStorage(),
       partialize: (state) => ({ servers: state.servers }),
-      onRehydrateStorage: () => (state) => {
-        if (state && Array.isArray(state.servers)) {
-          state.servers = state.servers.map((s: ServerData) => ({
-            ...s,
-            token: s.token ? decrypt(s.token) : '',
-            username: s.username ? decrypt(s.username) : '',
-            password: s.password ? decrypt(s.password) : '',
-          }));
-        }
-      },
+      // onRehydrateStorage 不再改 state — storage 层已经处理完解密
+      version: 2,
     }
   )
 );

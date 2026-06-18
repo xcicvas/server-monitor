@@ -41,13 +41,25 @@ const MAX_BODY_SIZE = '10kb';
 const REQUEST_TIMEOUT_MS = 5000;
 
 // ─── 用户账户 ──────────────────────────────────────────────────────────────
-// 默认账户：admin / admin（生产环境请通过环境变量或配置文件修改）
-const DEFAULT_USER = { username: 'admin', passwordHash: bcrypt.hashSync('admin', 10) };
+// 默认账户：admin / admin（首次部署时自动写入 users.json，之后不再重建）
+// 生产环境请立即登录后修改密码，或用环境变量 ADMIN_PASSWORD 覆盖默认值
+const DEFAULT_ADMIN_USERNAME = process.env.ADMIN_USERNAME || 'admin';
+const DEFAULT_ADMIN_PASSWORD = process.env.ADMIN_PASSWORD || 'admin';
+const DEFAULT_ADMIN = {
+  username: DEFAULT_ADMIN_USERNAME,
+  passwordHash: bcrypt.hashSync(DEFAULT_ADMIN_PASSWORD, 10),
+  createdAt: Date.now(),
+};
 
 const usersFile = path.join(HISTORY_DIR, 'users.json');
 let usersCache = null;       // 内存缓存
 let usersCacheMtime = 0;     // 文件上次修改时间
 let usersCacheExpireAt = 0;  // 缓存过期时间戳
+
+// 是否允许注册：默认关闭，必须显式开启
+//   ALLOW_REGISTER=true  → 允许注册（注册仍需管理员 JWT）
+//   其他任何情况          → 禁止注册
+const REGISTRATION_ALLOWED = process.env.ALLOW_REGISTER === 'true' || process.env.ALLOW_REGISTER === '1';
 
 function loadUsers() {
   try {
@@ -62,8 +74,9 @@ function loadUsers() {
       const raw = fs.readFileSync(usersFile, 'utf-8');
       users = JSON.parse(raw);
     } else {
-      // 首次运行，写入默认账户
-      users = [DEFAULT_USER];
+      // 首次运行：只在 users.json 真正不存在时才写入默认账户
+      // 一旦文件被创建，即使被清空也不会再自动重建——避免意外删除后出现后门
+      users = [DEFAULT_ADMIN];
       fs.writeFileSync(usersFile, JSON.stringify(users, null, 2), 'utf-8');
     }
     usersCache = users;
@@ -71,7 +84,8 @@ function loadUsers() {
     usersCacheExpireAt = now + 30_000; // 30 秒 TTL
     return users;
   } catch {
-    return [DEFAULT_USER];
+    // 解析失败时不要回退到默认账户——宁可报错也不要留下后门
+    return [];
   }
 }
 
@@ -517,30 +531,45 @@ app.post('/api/auth/login', async (req, res) => {
   res.json({ ok: true, token, username });
 });
 
-// 注册（可通过 DISABLE_REGISTER 环境变量禁用；首次部署建议开启后关闭）
-const DISABLE_REGISTER = process.env.DISABLE_REGISTER === '1' || process.env.DISABLE_REGISTER === 'true';
-
-app.post('/api/auth/register', async (req, res) => {
-  if (DISABLE_REGISTER) {
-    return res.status(403).json({ ok: false, error: '注册功能已禁用' });
+// 注册：需要管理员 JWT 且 REGISTRATION_ALLOWED=true，否则 403
+// 设计：登录是开放的（需要账号才能登录），但创建新账号必须先登录
+// 首次部署：admin/admin 由 bootstrap 自动写入 users.json，登录后立即修改密码
+app.post('/api/auth/register', verifyToken, async (req, res) => {
+  if (!REGISTRATION_ALLOWED) {
+    return res.status(403).json({ ok: false, error: '注册功能已禁用（如需开启请设置 ALLOW_REGISTER=true 后重启）' });
   }
   const { username, password } = req.body || {};
   if (!username || !password) {
     return res.status(400).json({ ok: false, error: '用户名和密码不能为空' });
   }
-  if (username.length < 3 || password.length < 6) {
-    return res.status(400).json({ ok: false, error: '用户名至少3位，密码至少6位' });
+  if (username.length < 3 || password.length < 8) {
+    return res.status(400).json({ ok: false, error: '用户名至少3位，密码至少8位' });
+  }
+  // 用户名：只允许字母数字下划线
+  if (!/^[a-zA-Z0-9_]+$/.test(username)) {
+    return res.status(400).json({ ok: false, error: '用户名只能包含字母、数字和下划线' });
   }
   const users = loadUsers();
+  if (!Array.isArray(users)) {
+    return res.status(500).json({ ok: false, error: '用户数据不可用' });
+  }
+  if (users.length >= 10) {
+    return res.status(403).json({ ok: false, error: '账号数量已达上限（10个）' });
+  }
   if (users.some((u) => u.username === username)) {
     return res.status(409).json({ ok: false, error: '用户名已存在' });
   }
-  users.push({ username, passwordHash: await bcrypt.hash(password, 10) });
+  users.push({
+    username,
+    passwordHash: await bcrypt.hash(password, 10),
+    createdAt: Date.now(),
+    createdBy: req.user && req.user.username ? req.user.username : 'admin',
+  });
   saveUsers(users);
   const ip = (req.ip || '').split(':').pop();
-  audit('REGISTER', ip, `username=${username}`);
-  const token = jwt.sign({ username }, JWT_SECRET, { expiresIn: JWT_EXPIRY });
-  res.json({ ok: true, token, username });
+  audit('REGISTER', ip, `username=${username} by=${req.user && req.user.username}`);
+  // 注册成功不再返回 token — 要获取 token 走登录接口
+  res.json({ ok: true, username });
 });
 
 // ─── 受保护路由 ────────────────────────────────────────────────────────────
@@ -744,6 +773,15 @@ server.listen(PORT, '0.0.0.0', () => {
     ? `✅ 仅允许 ${ALLOWED_ORIGINS.length} 个来源`
     : '⚠️ 未限制来源（建议内网使用）';
 
+  const registerHint = REGISTRATION_ALLOWED
+    ? '⚠️ 已开启（需管理员JWT）'
+    : '✅ 已关闭（仅管理员可登录）';
+
+  const users = (() => {
+    try { return loadUsers(); } catch { return []; }
+  })();
+  const usingDefault = users.length === 1 && users[0].username === 'admin';
+
   console.log(`
 ╔══════════════════════════════════════════════════════════╗
 ║         🖥️  服务器监控 Agent                              ║
@@ -754,6 +792,7 @@ server.listen(PORT, '0.0.0.0', () => {
 ║  安全头:    ✅ Helmet 已启用                             ║
 ║  限速:      ✅ ${RATE_LIMIT_MAX}次/${RATE_LIMIT_WINDOW_MS / 1000}秒                             ║
 ║  超时:      ✅ ${REQUEST_TIMEOUT_MS / 1000}秒                                      ║
+║  注册:      ${registerHint.padEnd(43)}║
 ║  WebSocket: ✅ ws://localhost:${PORT}/ws                    ║
 ║  历史:      ✅ 近 ${HISTORY_MAX} 条（${(HISTORY_MAX * 10 / 60).toFixed(0)} 分钟）                       ║
 ║  审计日志:  ✅ ${HISTORY_DIR}/audit.log                      ║
@@ -762,5 +801,6 @@ server.listen(PORT, '0.0.0.0', () => {
 ║  WS:       ws://localhost:${PORT}/ws?token=<jwt>           ║
 ║  Health:   http://localhost:${PORT}/api/health             ║
 ╚══════════════════════════════════════════════════════════╝
+${usingDefault ? '⚠️  警告：正在使用默认账号 admin/admin，登录后请立即修改密码' : ''}
 `);
 });

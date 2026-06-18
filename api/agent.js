@@ -412,35 +412,59 @@ function broadcastMetrics() {
 const broadcastInterval = setInterval(broadcastMetrics, 10_000);
 
 wss.on('connection', (ws, req) => {
-  // WebSocket 认证：token 在 query 里
+  const ip = (req.socket.remoteAddress || '').split(':').pop();
+  let authenticated = false;
+  let userInfo = null;
+
   const url = new URL(req.url, `http://localhost`);
-  const token = url.searchParams.get('token');
-  if (!token) {
-    ws.close(4001, 'No token');
-    return;
+  const queryToken = url.searchParams.get('token');
+
+  if (queryToken) {
+    try {
+      const payload = jwt.verify(queryToken, JWT_SECRET);
+      authenticated = true;
+      userInfo = payload;
+      audit('WS_CONNECT', ip, `username=${payload.username}`);
+      ws.user = payload;
+      wsClients.add(ws);
+      ws.send(JSON.stringify({ type: 'metrics', data: getSystemMetrics(), ts: Date.now() }));
+      ws.send(JSON.stringify({ type: 'connected', username: payload.username, uptime: process.uptime() }));
+    } catch {
+      ws.close(4001, 'Invalid token');
+      return;
+    }
   }
-  try {
-    const payload = jwt.verify(token, JWT_SECRET);
-    const ip = (req.socket.remoteAddress || '').split(':').pop();
-    audit('WS_CONNECT', ip, `username=${payload.username}`);
-    ws.user = payload;
-    wsClients.add(ws);
 
-    ws.on('close', () => {
-      wsClients.delete(ws);
-      audit('WS_DISCONNECT', ip, `username=${payload.username}`);
-    });
+  ws.on('message', (data) => {
+    try {
+      const msg = JSON.parse(data);
+      if (msg.type === 'auth' && !authenticated) {
+        try {
+          const payload = jwt.verify(msg.token, JWT_SECRET);
+          authenticated = true;
+          userInfo = payload;
+          audit('WS_CONNECT', ip, `username=${payload.username}`);
+          ws.user = payload;
+          wsClients.add(ws);
+          ws.send(JSON.stringify({ type: 'auth_ok', username: payload.username }));
+          ws.send(JSON.stringify({ type: 'metrics', data: getSystemMetrics(), ts: Date.now() }));
+        } catch {
+          ws.send(JSON.stringify({ type: 'auth_error', error: 'Invalid token' }));
+        }
+      }
+    } catch {}
+  });
 
-    ws.on('error', () => {
-      wsClients.delete(ws);
-    });
+  ws.on('close', () => {
+    wsClients.delete(ws);
+    if (userInfo) {
+      audit('WS_DISCONNECT', ip, `username=${userInfo.username}`);
+    }
+  });
 
-    // 连接后立即发送一次
-    ws.send(JSON.stringify({ type: 'metrics', data: getSystemMetrics(), ts: Date.now() }));
-    ws.send(JSON.stringify({ type: 'connected', username: payload.username, uptime: process.uptime() }));
-  } catch {
-    ws.close(4001, 'Invalid token');
-  }
+  ws.on('error', () => {
+    wsClients.delete(ws);
+  });
 });
 
 // 处理 HTTP upgrade 请求

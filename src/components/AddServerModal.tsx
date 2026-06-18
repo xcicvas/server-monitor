@@ -14,15 +14,41 @@ interface AddServerModalProps {
   }) => void;
 }
 
-const PRIVATE_IP_RE = /^(127\.|10\.|172\.(1[6-9]|2[0-9]|3[0-1])\.|192\.168\.|localhost|::1|fe80)/i;
+const PRIVATE_IP_RE = /^(127\.|10\.|172\.(1[6-9]|2[0-9]|3[0-1])\.|192\.168\.|0\.|169\.254\.|localhost|::1|fe80|::ffff:)/i;
 
-function isPrivateAddress(address: string): boolean {
+function isPrivateIp(ip: string): boolean {
+  if (!ip) return false;
+  ip = ip.toLowerCase();
+  if (PRIVATE_IP_RE.test(ip)) return true;
+  const parts = ip.split('.').map(Number);
+  if (parts.length === 4 && !isNaN(parts[0])) {
+    if (parts[0] === 0) return true;
+    if (parts[0] === 10) return true;
+    if (parts[0] === 127) return true;
+    if (parts[0] === 169 && parts[1] === 254) return true;
+    if (parts[0] === 172 && parts[1] >= 16 && parts[1] <= 31) return true;
+    if (parts[0] === 192 && parts[1] === 168) return true;
+  }
+  return false;
+}
+
+async function checkSSRF(address: string): Promise<boolean> {
   try {
     const urlStr = /^https?:\/\//i.test(address) ? address : `http://${address}`;
     const u = new URL(urlStr);
-    return PRIVATE_IP_RE.test(u.hostname);
-  } catch {
+    if (isPrivateIp(u.hostname)) return true;
+    try {
+      const addr = await fetch(`https://dns.google/resolve?name=${encodeURIComponent(u.hostname)}&type=A`);
+      const data = await addr.json();
+      if (data.Answer) {
+        for (const ans of data.Answer) {
+          if (ans.data && isPrivateIp(ans.data)) return true;
+        }
+      }
+    } catch {}
     return false;
+  } catch {
+    return true;
   }
 }
 
@@ -49,7 +75,7 @@ export function AddServerModal({ isOpen, onClose, onAdd }: AddServerModalProps) 
 
   if (!isOpen) return null;
 
-  const validate = () => {
+  const validateBasic = () => {
     const e: Record<string, string> = {};
     if (!name.trim()) e.name = '请输入服务器名称';
     if (!address.trim()) {
@@ -59,9 +85,6 @@ export function AddServerModal({ isOpen, onClose, onAdd }: AddServerModalProps) 
         ? address.trim()
         : `http://${address.trim()}`;
       try { new URL(normalized); } catch { e.address = '地址格式不正确'; }
-      if (!e.address && isPrivateAddress(address.trim())) {
-        e.address = '不支持内网 IP 地址，请使用公网可访问的 Agent 地址';
-      }
     }
     if (interval < 1 || interval > 300) e.interval = '刷新间隔需在 1-300 秒之间';
     setErrors(e);
@@ -70,7 +93,7 @@ export function AddServerModal({ isOpen, onClose, onAdd }: AddServerModalProps) 
 
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
-    if (!validate()) return;
+    if (!validateBasic()) return;
 
     const urlStr = /^https?:\/\//i.test(address.trim()) ? address.trim() : `http://${address.trim()}`;
 
@@ -78,6 +101,13 @@ export function AddServerModal({ isOpen, onClose, onAdd }: AddServerModalProps) 
     setLoginError('');
 
     try {
+      const isPrivate = await checkSSRF(address.trim());
+      if (isPrivate) {
+        setErrors({ address: '不支持内网 IP 地址，请使用公网可访问的 Agent 地址' });
+        setLoading(false);
+        return;
+      }
+
       const resp = await fetch(`${urlStr}/api/auth/login`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },

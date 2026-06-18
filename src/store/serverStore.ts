@@ -2,26 +2,53 @@ import { create } from 'zustand';
 import { persist } from 'zustand/middleware';
 import { createJSONStorage } from 'zustand/middleware';
 
-// ─── 安全工具：Token 混淆 ──────────────────────────────────────────────────
-function obfuscate(str: string): string {
+const STORAGE_KEY = 'server-monitor-storage';
+const HISTORY_KEY = 'server-monitor-history';
+
+const ENCRYPTION_KEY = 'server-monitor-v2-key';
+
+function deriveKey(key: string): Uint8Array {
+  const hash = new Uint8Array(32);
+  for (let i = 0; i < key.length; i++) {
+    hash[i % 32] ^= key.charCodeAt(i);
+  }
+  return hash;
+}
+
+function encrypt(str: string): string {
   try {
+    const key = deriveKey(ENCRYPTION_KEY);
+    const encoder = new TextEncoder();
+    const data = encoder.encode(str);
+    const encrypted = new Uint8Array(data.length);
+    for (let i = 0; i < data.length; i++) {
+      encrypted[i] = data[i] ^ key[i % key.length];
+    }
+    return btoa(String.fromCharCode(...encrypted));
+  } catch {
     return btoa(encodeURIComponent(str));
-  } catch {
-    return str;
   }
 }
 
-function deobfuscate(str: string): string {
+function decrypt(str: string): string {
   try {
-    return decodeURIComponent(atob(str));
+    const key = deriveKey(ENCRYPTION_KEY);
+    const bytes = new Uint8Array(atob(str).split('').map(c => c.charCodeAt(0)));
+    const decrypted = new Uint8Array(bytes.length);
+    for (let i = 0; i < bytes.length; i++) {
+      decrypted[i] = bytes[i] ^ key[i % key.length];
+    }
+    return new TextDecoder().decode(decrypted);
   } catch {
-    return str;
+    try {
+      return decodeURIComponent(atob(str));
+    } catch {
+      return str;
+    }
   }
 }
 
-const localStorage_ = createJSONStorage(() => localStorage);
-
-// ─── 历史数据内存 Store（不持久化）────────────────────────────────────────
+// ─── 历史数据持久化 ─────────────────────────────────────────────────────────
 const HISTORY_MAX = 30;
 
 interface HistoryEntry {
@@ -33,10 +60,35 @@ interface HistoryEntry {
 
 type HistoryMap = Map<string, HistoryEntry[]>;
 
-const historyMap: HistoryMap = new Map();
+function loadHistory(): HistoryMap {
+  const map = new Map<string, HistoryEntry[]>();
+  try {
+    const raw = localStorage.getItem(HISTORY_KEY);
+    if (raw) {
+      const data = JSON.parse(raw);
+      for (const [id, entries] of Object.entries(data)) {
+        if (Array.isArray(entries)) {
+          map.set(id, entries);
+        }
+      }
+    }
+  } catch {}
+  return map;
+}
+
+function saveHistory(map: HistoryMap): void {
+  try {
+    const data: Record<string, HistoryEntry[]> = {};
+    for (const [id, entries] of map) {
+      data[id] = entries;
+    }
+    localStorage.setItem(HISTORY_KEY, JSON.stringify(data));
+  } catch {}
+}
+
+const historyMap: HistoryMap = loadHistory();
 
 export function useServerHistory(serverId: string): HistoryEntry[] {
-  // 订阅 store 变化以触发重渲染
   useServerStore((s) => s.servers);
   return historyMap.get(serverId) ?? [];
 }
@@ -70,7 +122,6 @@ export interface ServerMetrics {
     rxMbps: number;
     txMbps: number;
   };
-  /** 系统负载（1/5/15分钟平均） */
   load: {
     load1: number;
     load5: number;
@@ -78,7 +129,6 @@ export interface ServerMetrics {
     loadPerCpu: number;
     cpuCount: number;
   };
-  /** 磁盘 I/O */
   diskIO: {
     readBytes: number;
     writeBytes: number;
@@ -91,9 +141,9 @@ export interface ServerData {
   id: string;
   name: string;
   address: string;
-  token: string;          // JWT 令牌（混淆存储）
-  username: string;       // 登录用户名（混淆存储）
-  password: string;        // 登录密码（混淆存储）
+  token: string;
+  username: string;
+  password: string;
   interval: number;
   createdAt: number;
   status: 'online' | 'offline' | 'checking';
@@ -126,9 +176,9 @@ export const useServerStore = create<ServerStore>()(
               id: genId(),
               name,
               address,
-              token: token ? obfuscate(token) : '',
-              username: username ? obfuscate(username) : '',
-              password: password ? obfuscate(password) : '',
+              token: token ? encrypt(token) : '',
+              username: username ? encrypt(username) : '',
+              password: password ? encrypt(password) : '',
               interval,
               createdAt: Date.now(),
               status: 'checking',
@@ -142,6 +192,7 @@ export const useServerStore = create<ServerStore>()(
 
       removeServer: (id) => {
         historyMap.delete(id);
+        saveHistory(historyMap);
         set((state) => ({ servers: state.servers.filter((s) => s.id !== id) }));
       },
 
@@ -151,13 +202,13 @@ export const useServerStore = create<ServerStore>()(
             if (s.id !== id) return s;
             const processed = { ...updates };
             if (processed.token !== undefined) {
-              processed.token = processed.token ? obfuscate(processed.token) : '';
+              processed.token = processed.token ? encrypt(processed.token) : '';
             }
             if (processed.username !== undefined) {
-              processed.username = processed.username ? obfuscate(processed.username) : '';
+              processed.username = processed.username ? encrypt(processed.username) : '';
             }
             if (processed.password !== undefined) {
-              processed.password = processed.password ? obfuscate(processed.password) : '';
+              processed.password = processed.password ? encrypt(processed.password) : '';
             }
             return { ...s, ...processed };
           }),
@@ -172,7 +223,6 @@ export const useServerStore = create<ServerStore>()(
 
       setMetrics: (id, metrics, err) =>
         set((state) => {
-          // 更新历史记录
           if (!err && metrics) {
             const history = historyMap.get(id) ?? [];
             history.push({
@@ -183,6 +233,7 @@ export const useServerStore = create<ServerStore>()(
             });
             if (history.length > HISTORY_MAX) history.shift();
             historyMap.set(id, history);
+            saveHistory(historyMap);
           }
           return {
             servers: state.servers.map((s) =>
@@ -200,18 +251,16 @@ export const useServerStore = create<ServerStore>()(
         }),
     }),
     {
-      name: 'server-monitor-storage',
-      storage: localStorage_, // 使用 localStorage 持久化配置
-      // 只持久化 servers 数组，不包含其他状态
+      name: STORAGE_KEY,
+      storage: createJSONStorage(() => localStorage),
       partialize: (state) => ({ servers: state.servers }),
-      // 读取时对敏感字段去混淆
       onRehydrateStorage: () => (state) => {
         if (state && Array.isArray(state.servers)) {
           state.servers = state.servers.map((s: ServerData) => ({
             ...s,
-            token: s.token ? deobfuscate(s.token) : '',
-            username: s.username ? deobfuscate(s.username) : '',
-            password: s.password ? deobfuscate(s.password) : '',
+            token: s.token ? decrypt(s.token) : '',
+            username: s.username ? decrypt(s.username) : '',
+            password: s.password ? decrypt(s.password) : '',
           }));
         }
       },

@@ -189,7 +189,7 @@ function getSystemMetrics() {
       usagePercent: (200 / 512) * 100,
     },
     network: {
-      interfaces: net,
+      interfaces: net.length,
       rxMbps: 0,
       txMbps: 0,
     },
@@ -269,7 +269,7 @@ if (STRICT_CORS) {
     allowedHeaders: ['Content-Type', 'Authorization'],
   }));
 } else {
-  app.use(cors({ origin: false, methods: ['GET', 'POST'] }));
+  app.use(cors({ origin: true, methods: ['GET', 'POST'], allowedHeaders: ['Content-Type', 'Authorization'] }));
 }
 
 app.disable('x-powered-by');
@@ -332,7 +332,7 @@ app.get('/api/metrics', verifyToken, (req, res) => {
 });
 
 // 获取进程列表
-app.get('/api/processes', verifyToken, (_req, res) => {
+app.get('/api/processes', verifyToken, (req, res) => {
   try {
     const ip = (req.ip || '').split(':').pop();
     audit('PROCESSES', ip);

@@ -352,6 +352,8 @@ server-monitor/
 │   ├── users.json          # 用户数据（bcrypt 哈希）
 │   ├── audit.log           # 审计日志
 │   └── metrics_history.json # 历史指标数据
+├── scripts/
+│   └── deploy.sh            # 一键部署脚本（Linux / macOS）
 ├── Dockerfile               # 多阶段构建镜像
 ├── docker-compose.yml       # Docker Compose 编排
 ├── package.json
@@ -547,6 +549,66 @@ sudo systemctl enable server-monitor-agent
 sudo systemctl start server-monitor-agent
 sudo systemctl status server-monitor-agent
 ```
+
+### 一键部署脚本（推荐）
+
+项目提供了开箱即用的一键部署脚本，适用于 Ubuntu / Debian / CentOS / RHEL / Rocky / AlmaLinux / macOS。
+
+```bash
+# 克隆项目
+git clone https://github.com/xcicvas/server-monitor.git
+cd server-monitor
+
+# 赋予脚本执行权限
+chmod +x scripts/deploy.sh
+
+# 全自动部署（默认配置，自动生成密钥和密码）
+sudo ./scripts/deploy.sh
+
+# 自定义参数部署
+sudo ./scripts/deploy.sh \
+  -p 7001 \
+  -j my_very_long_secret_key_here \
+  -u admin \
+  -w your_strong_password \
+  -o https://monitor.yourdomain.com
+
+# 查看帮助
+./scripts/deploy.sh -h
+
+# 卸载
+sudo ./scripts/deploy.sh --uninstall
+```
+
+**脚本自动完成以下操作：**
+
+| 步骤 | 说明 |
+|------|------|
+| 环境检测 | 识别操作系统、架构，自动使用 sudo 提权 |
+| Node.js 安装 | 未安装或版本低于 20 时，自动通过 NodeSource 安装 |
+| Agent 部署 | 复制 `api/agent.js` 到 `/opt/server-monitor-agent`，安装依赖 |
+| JWT 密钥 | 自动生成 32 位随机密钥，或通过 `-j` 参数指定 |
+| 管理员账户 | 自动生成密码，或通过 `-u` / `-w` 参数指定 |
+| systemd 服务 | 注册为系统服务，开机自启，崩溃自动重启 |
+| 防火墙配置 | 自动开放 ufw / firewalld 的指定端口 |
+| 信息汇总 | 输出 Agent 地址、WebSocket、凭据、常用管理命令 |
+
+**部署成功后输出示例：**
+
+```
+✓ Agent 部署完成
+  Agent 地址:   http://192.168.1.100:7001
+  WebSocket:    ws://192.168.1.100:7001/ws
+  管理员账户:   admin
+  管理员密码:   自动生成的密码（请妥善保存）
+  启动服务:     sudo systemctl start server-monitor-agent
+  查看状态:     sudo systemctl status server-monitor-agent
+  查看日志:     sudo journalctl -u server-monitor-agent -f
+  重启服务:     sudo systemctl restart server-monitor-agent
+  卸载服务:     ./scripts/deploy.sh --uninstall
+```
+
+> 💡 **提示**：如需将面板部署在其他域名访问 Agent，请通过 `-o https://你的域名.com` 设置 CORS 白名单；云服务器还需要在云服务商安全组面板开放对应端口。
 
 ### Docker 部署（最简方式）
 

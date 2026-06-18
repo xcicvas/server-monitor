@@ -1,13 +1,19 @@
-import { useState, useEffect } from 'react';
-import { X, Server, Terminal } from 'lucide-react';
+import { useState } from 'react';
+import { X, Server, Terminal, Loader, AlertCircle } from 'lucide-react';
 
 interface AddServerModalProps {
   isOpen: boolean;
   onClose: () => void;
-  onAdd: (data: { name: string; address: string; token?: string; interval: number }) => void;
+  onAdd: (data: {
+    name: string;
+    address: string;
+    token: string;
+    username: string;
+    password: string;
+    interval: number;
+  }) => void;
 }
 
-// ─── SSRF 防护：禁止内网 IP ────────────────────────────────────────────────
 const PRIVATE_IP_RE = /^(127\.|10\.|172\.(1[6-9]|2[0-9]|3[0-1])\.|192\.168\.|localhost|::1|fe80)/i;
 
 function isPrivateAddress(address: string): boolean {
@@ -23,26 +29,23 @@ function isPrivateAddress(address: string): boolean {
 export function AddServerModal({ isOpen, onClose, onAdd }: AddServerModalProps) {
   const [name, setName] = useState('');
   const [address, setAddress] = useState('');
-  const [token, setToken] = useState('');
+  const [username, setUsername] = useState('');
+  const [password, setPassword] = useState('');
   const [interval, setInterval] = useState(5);
   const [errors, setErrors] = useState<Record<string, string>>({});
+  const [loginError, setLoginError] = useState('');
+  const [loading, setLoading] = useState(false);
 
-  useEffect(() => {
-    if (isOpen) {
-      setName('');
-      setAddress('');
-      setToken('');
-      setInterval(5);
-      setErrors({});
-    }
-  }, [isOpen]);
-
-  useEffect(() => {
-    if (!isOpen) return;
-    const onKey = (e: KeyboardEvent) => { if (e.key === 'Escape') onClose(); };
-    window.addEventListener('keydown', onKey);
-    return () => window.removeEventListener('keydown', onKey);
-  }, [isOpen, onClose]);
+  function reset() {
+    setName('');
+    setAddress('');
+    setUsername('');
+    setPassword('');
+    setInterval(5);
+    setErrors({});
+    setLoginError('');
+    setLoading(false);
+  }
 
   if (!isOpen) return null;
 
@@ -65,12 +68,42 @@ export function AddServerModal({ isOpen, onClose, onAdd }: AddServerModalProps) 
     return Object.keys(e).length === 0;
   };
 
-  const handleSubmit = (e: React.FormEvent) => {
+  const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
     if (!validate()) return;
+
     const urlStr = /^https?:\/\//i.test(address.trim()) ? address.trim() : `http://${address.trim()}`;
-    onAdd({ name: name.trim(), address: urlStr, token: token.trim(), interval });
-    onClose();
+
+    setLoading(true);
+    setLoginError('');
+
+    try {
+      const resp = await fetch(`${urlStr}/api/auth/login`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ username: username.trim(), password }),
+      });
+      const data = await resp.json();
+      if (!resp.ok || !data.ok) {
+        setLoginError(data.error || '登录失败，请检查用户名和密码');
+        setLoading(false);
+        return;
+      }
+      // 登录成功，添加到列表
+      onAdd({
+        name: name.trim(),
+        address: urlStr,
+        token: data.token,
+        username: username.trim(),
+        password: password,
+        interval,
+      });
+      reset();
+      onClose();
+    } catch (err) {
+      setLoginError(`无法连接到 ${urlStr}，请确认 Agent 已启动且地址正确`);
+      setLoading(false);
+    }
   };
 
   return (
@@ -78,7 +111,6 @@ export function AddServerModal({ isOpen, onClose, onAdd }: AddServerModalProps) 
       <div className="absolute inset-0 bg-stone-900/30 backdrop-blur-sm animate-fade-in" onClick={onClose} />
 
       <div className="relative w-full max-w-md bg-white rounded-2xl shadow-2xl shadow-stone-900/10 animate-scale-in overflow-hidden">
-        {/* 顶部线 */}
         <div className="h-0.5 bg-gradient-to-r from-stone-200 via-brand to-stone-200" />
 
         {/* Header */}
@@ -89,7 +121,7 @@ export function AddServerModal({ isOpen, onClose, onAdd }: AddServerModalProps) 
             </div>
             <div>
               <h2 className="text-sm font-semibold text-stone-800 font-display">添加服务器</h2>
-              <p className="text-xs text-stone-400 mt-0.5">配置 Agent 端点开始监控</p>
+              <p className="text-xs text-stone-400 mt-0.5">登录后开始监控</p>
             </div>
           </div>
           <button onClick={onClose} className="btn-icon" type="button">
@@ -110,6 +142,7 @@ export function AddServerModal({ isOpen, onClose, onAdd }: AddServerModalProps) 
               placeholder="例如：生产环境-北京"
               className={`input ${errors.name ? 'input-error' : ''}`}
               autoFocus
+              disabled={loading}
             />
             {errors.name && <p className="mt-1.5 text-xs text-red-500">{errors.name}</p>}
           </div>
@@ -122,31 +155,47 @@ export function AddServerModal({ isOpen, onClose, onAdd }: AddServerModalProps) 
               type="text"
               value={address}
               onChange={(e) => setAddress(e.target.value)}
-              placeholder="http://192.168.1.10:7001"
+              placeholder="http://服务器IP:7001"
               className={`input input-mono ${errors.address ? 'input-error' : ''}`}
+              disabled={loading}
             />
             {errors.address ? (
               <p className="mt-1.5 text-xs text-red-500">{errors.address}</p>
             ) : (
-              <p className="mt-1.5 text-xs text-stone-400">Agent 默认提供 /api/metrics 接口</p>
+              <p className="mt-1.5 text-xs text-stone-400">请使用公网可访问的地址</p>
             )}
           </div>
 
-          {/* 访问令牌（可选） */}
           <div>
             <label className="block text-xs font-semibold text-stone-500 uppercase tracking-wider mb-1.5">
-              访问令牌 <span className="text-stone-300 normal-case font-normal">(可选)</span>
+              用户名 <span className="text-red-400 normal-case">*</span>
+            </label>
+            <input
+              type="text"
+              value={username}
+              onChange={(e) => setUsername(e.target.value)}
+              placeholder="admin"
+              className="input"
+              autoComplete="username"
+              disabled={loading}
+            />
+          </div>
+
+          <div>
+            <label className="block text-xs font-semibold text-stone-500 uppercase tracking-wider mb-1.5">
+              密码 <span className="text-red-400 normal-case">*</span>
             </label>
             <input
               type="password"
-              value={token}
-              onChange={(e) => setToken(e.target.value)}
-              placeholder="与 Agent 的 AUTH_TOKEN 一致"
-              className="input input-mono"
-              autoComplete="off"
+              value={password}
+              onChange={(e) => setPassword(e.target.value)}
+              placeholder="••••••"
+              className="input"
+              autoComplete="current-password"
+              disabled={loading}
             />
             <p className="mt-1.5 text-xs text-stone-400">
-              Agent 设置了 <code className="px-1 py-0.5 rounded bg-stone-100 text-stone-600 font-mono text-[10px]">AUTH_TOKEN</code> 时必填
+              默认：admin / admin（首次登录后请修改密码）
             </p>
           </div>
 
@@ -162,6 +211,7 @@ export function AddServerModal({ isOpen, onClose, onAdd }: AddServerModalProps) 
                 min={1}
                 max={300}
                 className={`input input-mono flex-1 ${errors.interval ? 'input-error' : ''}`}
+                disabled={loading}
               />
               <div className="flex gap-1">
                 {[3, 5, 10, 30].map((v) => (
@@ -171,9 +221,10 @@ export function AddServerModal({ isOpen, onClose, onAdd }: AddServerModalProps) 
                     onClick={() => setInterval(v)}
                     className={`px-2.5 py-1.5 rounded-lg text-xs font-mono font-medium transition-colors
                       ${interval === v
-                        ? 'bg-stone-800 text-white'
+                        ? 'bg-stone-800 text-white dark:bg-stone-700'
                         : 'bg-stone-100 text-stone-500 hover:bg-stone-200'
                       }`}
+                    disabled={loading}
                   >
                     {v}s
                   </button>
@@ -182,6 +233,13 @@ export function AddServerModal({ isOpen, onClose, onAdd }: AddServerModalProps) 
             </div>
             {errors.interval && <p className="mt-1.5 text-xs text-red-500">{errors.interval}</p>}
           </div>
+
+          {loginError && (
+            <div className="flex items-center gap-2 p-3 rounded-xl bg-red-50 border border-red-100 text-xs text-red-600">
+              <AlertCircle className="w-4 h-4 shrink-0" strokeWidth={2} />
+              {loginError}
+            </div>
+          )}
 
           {/* 提示 */}
           <div className="flex gap-2.5 p-3 rounded-xl bg-stone-50 border border-stone-200">
@@ -193,11 +251,16 @@ export function AddServerModal({ isOpen, onClose, onAdd }: AddServerModalProps) 
 
           {/* 提交 */}
           <div className="flex gap-2 pt-1">
-            <button type="button" onClick={onClose} className="btn-ghost flex-1">
+            <button type="button" onClick={onClose} className="btn-ghost flex-1" disabled={loading}>
               取消
             </button>
-            <button type="submit" className="btn-primary flex-1">
-              添加
+            <button type="submit" className="btn-primary flex-1" disabled={loading}>
+              {loading ? (
+                <>
+                  <Loader className="w-4 h-4 animate-spin" strokeWidth={2} />
+                  登录中...
+                </>
+              ) : '添加'}
             </button>
           </div>
         </form>

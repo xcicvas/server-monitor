@@ -1,6 +1,6 @@
 import { useState, useCallback } from 'react';
 import { useServerStore } from './store/serverStore';
-import { usePollingServers } from './hooks/usePollingServers';
+import { useWebSocketServers } from './hooks/useWebSocket';
 import { Header } from './components/Header';
 import { ServerMonitorCard } from './components/ServerMonitorCard';
 import { AddServerModal } from './components/AddServerModal';
@@ -10,14 +10,9 @@ import { OverviewStats } from './components/OverviewStats';
 export default function App() {
   const [isModalOpen, setIsModalOpen] = useState(false);
   const { servers, addServer, removeServer } = useServerStore();
-  const { probeOne } = usePollingServers();
 
-  const handleAdd = useCallback(
-    ({ name, address, interval }: { name: string; address: string; interval: number }) => {
-      addServer({ name, address, interval });
-    },
-    [addServer]
-  );
+  // WebSocket 自动管理所有服务器的连接
+  useWebSocketServers();
 
   const handleDelete = useCallback(
     (id: string) => {
@@ -46,9 +41,9 @@ export default function App() {
                   server={server}
                   index={index}
                   onDelete={handleDelete}
-                  onRefresh={(id) => {
-                    const s = servers.find((x) => x.id === id);
-                    if (s) probeOne(s);
+                  onRefresh={() => {
+                    // WebSocket 会自动重连，这里手动触发一下
+                    useServerStore.getState().setStatus(server.id, 'checking');
                   }}
                 />
               ))}
@@ -60,7 +55,7 @@ export default function App() {
       <AddServerModal
         isOpen={isModalOpen}
         onClose={() => setIsModalOpen(false)}
-        onAdd={handleAdd}
+        onAdd={(data) => addServer(data)}
       />
     </div>
   );

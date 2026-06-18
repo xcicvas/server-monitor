@@ -70,13 +70,30 @@ export interface ServerMetrics {
     rxMbps: number;
     txMbps: number;
   };
+  /** 系统负载（1/5/15分钟平均） */
+  load: {
+    load1: number;
+    load5: number;
+    load15: number;
+    loadPerCpu: number;
+    cpuCount: number;
+  };
+  /** 磁盘 I/O */
+  diskIO: {
+    readBytes: number;
+    writeBytes: number;
+    readMbps: number;
+    writeMbps: number;
+  };
 }
 
 export interface ServerData {
   id: string;
   name: string;
   address: string;
-  token: string;        // 混淆存储（Base64编码）
+  token: string;          // JWT 令牌（混淆存储）
+  username: string;       // 登录用户名（混淆存储）
+  password: string;        // 登录密码（混淆存储）
   interval: number;
   createdAt: number;
   status: 'online' | 'offline' | 'checking';
@@ -87,7 +104,7 @@ export interface ServerData {
 
 interface ServerStore {
   servers: ServerData[];
-  addServer: (data: { name: string; address: string; token?: string; interval: number }) => void;
+  addServer: (data: { name: string; address: string; token?: string; username?: string; password?: string; interval: number }) => void;
   removeServer: (id: string) => void;
   updateServer: (id: string, updates: Partial<ServerData>) => void;
   setStatus: (id: string, status: ServerData['status']) => void;
@@ -102,14 +119,16 @@ export const useServerStore = create<ServerStore>()(
     (set) => ({
       servers: [],
 
-      addServer: ({ name, address, token = '', interval }) =>
+      addServer: ({ name, address, token = '', username = '', password = '', interval }) =>
         set((state) => ({
           servers: [
             {
               id: genId(),
               name,
               address,
-              token: token ? obfuscate(token) : '', // 混淆存储
+              token: token ? obfuscate(token) : '',
+              username: username ? obfuscate(username) : '',
+              password: password ? obfuscate(password) : '',
               interval,
               createdAt: Date.now(),
               status: 'checking',
@@ -130,10 +149,15 @@ export const useServerStore = create<ServerStore>()(
         set((state) => ({
           servers: state.servers.map((s) => {
             if (s.id !== id) return s;
-            // 如果更新中包含 token，同样混淆
             const processed = { ...updates };
             if (processed.token !== undefined) {
               processed.token = processed.token ? obfuscate(processed.token) : '';
+            }
+            if (processed.username !== undefined) {
+              processed.username = processed.username ? obfuscate(processed.username) : '';
+            }
+            if (processed.password !== undefined) {
+              processed.password = processed.password ? obfuscate(processed.password) : '';
             }
             return { ...s, ...processed };
           }),
@@ -180,12 +204,14 @@ export const useServerStore = create<ServerStore>()(
       storage: localStorage_, // 使用 localStorage 持久化配置
       // 只持久化 servers 数组，不包含其他状态
       partialize: (state) => ({ servers: state.servers }),
-      // 读取时对 token 去混淆
+      // 读取时对敏感字段去混淆
       onRehydrateStorage: () => (state) => {
         if (state && Array.isArray(state.servers)) {
           state.servers = state.servers.map((s: ServerData) => ({
             ...s,
             token: s.token ? deobfuscate(s.token) : '',
+            username: s.username ? deobfuscate(s.username) : '',
+            password: s.password ? deobfuscate(s.password) : '',
           }));
         }
       },

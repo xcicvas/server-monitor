@@ -18,7 +18,6 @@ log_error() { echo -e "${LOG_PREFIX} ${COLOR_RED}[ERROR]${COLOR_RESET} $1"; }
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" &>/dev/null && pwd)"
 PROJECT_DIR="$(cd "${SCRIPT_DIR}/.." &>/dev/null && pwd)"
 AGENT_FILE="${PROJECT_DIR}/api/agent.js"
-DATA_DIR="${PROJECT_DIR}/data"
 INSTALL_DIR="/opt/server-monitor-agent"
 
 show_help() {
@@ -34,24 +33,27 @@ ${COLOR_BLUE}用法:${COLOR_RESET}
 ${COLOR_BLUE}功能:${COLOR_RESET}
   · 检测操作系统与架构
   · 自动安装 Node.js 20+（如未安装）
-  · 配置 JWT 密钥与 CORS
-  · 创建管理员账户
+  · 通过环境变量配置管理员账号、JWT 密钥、CORS
   · 注册 systemd 服务，开机自启
   · 配置防火墙规则（如可用）
-  · 显示连接信息与管理命令
+  · 显示连接信息与安全提醒
 
 ${COLOR_BLUE}选项:${COLOR_RESET}
   -p, --port <端口>          Agent 监听端口（默认 7001）
   -j, --jwt <密钥>           JWT 签名密钥（默认自动生成）
   -o, --origin <域名>        允许的来源域名（逗号分隔，可选）
   -u, --username <用户名>    管理员用户名（默认 admin）
-  -w, --password <密码>      管理员密码（默认随机生成）
+  -w, --password <密码>      管理员密码（默认随机生成，部署后请立即修改）
   -n, --no-service           不注册 systemd 服务（仅运行一次）
   --uninstall                卸载 Agent 服务
 
+${COLOR_BLUE}安全说明:${COLOR_RESET}
+  注册接口默认关闭，首次管理员账号通过 ADMIN_USERNAME / ADMIN_PASSWORD 环境变量创建。
+  部署完成后请立即登录并修改密码。
+
 ${COLOR_BLUE}示例:${COLOR_RESET}
-  ./deploy.sh                                        # 全自动
-  ./deploy.sh -p 7001 -j my_secret_key -u admin
+  ./deploy.sh                                        # 全自动（随机密码）
+  ./deploy.sh -p 7001 -j my_secret_key -u admin -w MyStr0ngPass
   ./deploy.sh -o https://monitor.example.com
   ./deploy.sh --uninstall
 
@@ -161,7 +163,7 @@ generate_secret() {
   fi
   if [[ -z "${ADMIN_PASSWORD}" ]]; then
     ADMIN_PASSWORD="$(node -e "console.log(require('crypto').randomBytes(8).toString('hex'))" 2>/dev/null || date +%s%N | md5sum | head -c 12)"
-    log_warn "管理员密码已自动生成，请妥善保存"
+    log_warn "管理员密码已自动生成"
   fi
 }
 
@@ -217,9 +219,12 @@ configure_env() {
   ENV_FILE="${INSTALL_DIR}/.env"
   log_info "写入环境配置..."
 
+  # ADMIN_USERNAME / ADMIN_PASSWORD 由 Agent 自动创建第一个管理员账号（仅当 users.json 不存在时）
   ${SUDO} bash -c "cat > ${ENV_FILE}" <<EOF
 AGENT_PORT=${AGENT_PORT}
 JWT_SECRET=${JWT_SECRET}
+ADMIN_USERNAME=${ADMIN_USERNAME}
+ADMIN_PASSWORD=${ADMIN_PASSWORD}
 NODE_ENV=production
 EOF
 
@@ -230,42 +235,35 @@ EOF
   log_ok "配置文件: ${ENV_FILE}"
 }
 
-register_admin() {
-  log_info "注册管理员账户..."
+start_and_verify() {
+  log_info "启动 Agent 进程..."
 
-  REGISTER_URL="http://localhost:${AGENT_PORT}/api/auth/register"
-
-  if ${SUDO} curl -fsSL "${REGISTER_URL}" >/dev/null 2>&1; then
-    log_info "Agent 已在运行，直接调用注册接口"
-    REGISTER_RESULT="$(${SUDO} curl -sS -X POST "${REGISTER_URL}" \
-      -H "Content-Type: application/json" \
-      -d "{\"username\":\"${ADMIN_USERNAME}\",\"password\":\"${ADMIN_PASSWORD}\"}")"
-
-    if echo "${REGISTER_RESULT}" | grep -q "ok"; then
-      log_ok "管理员账户已创建: ${ADMIN_USERNAME}"
+  # 直接用 systemctl 启动（如果可用）或后台进程
+  if [[ "${INSTALL_SERVICE}" == "true" ]] && command -v systemctl &>/dev/null; then
+    # systemd 会读取 .env 文件，ADMIN_USERNAME / ADMIN_PASSWORD 会生效
+    ${SUDO} systemctl restart server-monitor-agent
+    sleep 2
+    if ${SUDO} systemctl is-active --quiet server-monitor-agent; then
+      log_ok "Agent 服务已启动"
     else
-      log_warn "注册返回: ${REGISTER_RESULT}"
+      log_error "Agent 服务启动失败，查看日志: journalctl -u server-monitor-agent"
+      ${SUDO} systemctl status server-monitor-agent --no-pager | head -20 || true
+      exit 1
     fi
-    return
-  fi
-
-  log_info "启动临时 Agent 进程以便注册..."
-  (cd "${INSTALL_DIR}" && nohup bash -c "AGENT_PORT=${AGENT_PORT} JWT_SECRET=${JWT_SECRET} ${ALLOWED_ORIGINS:+ALLOWED_ORIGINS=${ALLOWED_ORIGINS}} node api/agent.js" >/tmp/agent-init.log 2>&1 &)
-  TEMP_AGENT_PID=$!
-  sleep 3
-
-  REGISTER_RESULT="$(curl -sS -X POST "${REGISTER_URL}" \
-    -H "Content-Type: application/json" \
-    -d "{\"username\":\"${ADMIN_USERNAME}\",\"password\":\"${ADMIN_PASSWORD}\"}" 2>/dev/null || echo "")"
-
-  if echo "${REGISTER_RESULT}" | grep -q "ok"; then
-    log_ok "管理员账户已创建: ${ADMIN_USERNAME}"
   else
-    log_warn "注册返回: ${REGISTER_RESULT}（可能已注册）"
-  fi
+    # 无 systemd：后台进程方式，读取 .env 文件
+    (cd "${INSTALL_DIR}" && nohup bash -c "source ${ENV_FILE} && node api/agent.js" >/tmp/agent-init.log 2>&1 &)
+    sleep 3
 
-  kill ${TEMP_AGENT_PID} 2>/dev/null || true
-  sleep 1
+    # 验证进程是否存活
+    if curl -sf "http://localhost:${AGENT_PORT}/api/health" >/dev/null 2>&1; then
+      log_ok "Agent 进程已启动"
+    else
+      log_error "Agent 启动失败，查看日志: tail /tmp/agent-init.log"
+      tail -20 /tmp/agent-init.log 2>/dev/null || true
+      exit 1
+    fi
+  fi
 }
 
 install_systemd() {
@@ -309,15 +307,8 @@ EOF
 
   ${SUDO} systemctl daemon-reload
   ${SUDO} systemctl enable server-monitor-agent
-  ${SUDO} systemctl restart server-monitor-agent
 
-  sleep 2
-  if ${SUDO} systemctl is-active --quiet server-monitor-agent; then
-    log_ok "Agent 服务已启动并设置为开机自启"
-  else
-    log_error "Agent 服务启动失败，查看日志: journalctl -u server-monitor-agent"
-    ${SUDO} systemctl status server-monitor-agent --no-pager | head -20 || true
-  fi
+  log_ok "systemd 服务已注册"
 }
 
 install_launchd() {
@@ -343,6 +334,10 @@ install_launchd() {
     <string>${AGENT_PORT}</string>
     <key>JWT_SECRET</key>
     <string>${JWT_SECRET}</string>
+    <key>ADMIN_USERNAME</key>
+    <string>${ADMIN_USERNAME}</string>
+    <key>ADMIN_PASSWORD</key>
+    <string>${ADMIN_PASSWORD}</string>
   </dict>
   <key>RunAtLoad</key>
   <true/>
@@ -362,8 +357,8 @@ EOF
 }
 
 configure_firewall() {
-  if command -v ufw &>/dev/null && ${SUDO} ufw status | grep -qi active; then
-    if ! ${SUDO} ufw status numbered | grep -q "${AGENT_PORT}/tcp"; then
+  if command -v ufw &>/dev/null && ${SUDO} ufw status 2>/dev/null | grep -qi active; then
+    if ! ${SUDO} ufw status numbered 2>/dev/null | grep -q "${AGENT_PORT}/tcp"; then
       ${SUDO} ufw allow "${AGENT_PORT}/tcp" >/dev/null
       log_ok "已允许 ${AGENT_PORT}/tcp (ufw)"
     fi
@@ -408,9 +403,19 @@ show_summary() {
   echo -e "${COLOR_BLUE}  WebSocket:${COLOR_RESET}   ws://${SERVER_IP}:${AGENT_PORT}/ws"
   echo -e "${COLOR_BLUE}  健康检查:${COLOR_RESET}    curl http://localhost:${AGENT_PORT}/api/health"
   echo ""
+  echo -e "${COLOR_YELLOW}  ┌─────────────────────────────────────────────┐${COLOR_RESET}"
+  echo -e "${COLOR_YELLOW}  │  ⚠  首次登录后请立即修改密码！              │${COLOR_RESET}"
+  echo -e "${COLOR_YELLOW}  └─────────────────────────────────────────────┘${COLOR_RESET}"
+  echo ""
   echo -e "${COLOR_BLUE}  管理员账户:${COLOR_RESET} ${ADMIN_USERNAME}"
   echo -e "${COLOR_BLUE}  管理员密码:${COLOR_RESET} ${ADMIN_PASSWORD}"
   echo -e "${COLOR_YELLOW}  ⚠ 请妥善保存以上凭据，切勿泄露${COLOR_RESET}"
+  echo ""
+  echo -e "${COLOR_BLUE}  修改密码（登录后执行）:${COLOR_RESET}"
+  echo -e "  curl -X POST http://localhost:${AGENT_PORT}/api/auth/change-password \\"
+  echo -e "    -H 'Content-Type: application/json' \\"
+  echo -e "    -H 'Authorization: Bearer <JWT令牌>' \\"
+  echo -e "    -d '{\"oldPassword\":\"${ADMIN_PASSWORD}\",\"newPassword\":\"新密码\"}'"
   echo ""
   echo -e "${COLOR_BLUE}  常用命令:${COLOR_RESET}"
   echo -e "  启动服务:  ${SUDO} systemctl start server-monitor-agent"
@@ -435,8 +440,8 @@ main() {
   generate_secret
   copy_agent_files
   configure_env
-  register_admin
-  install_systemd
+  install_systemd        # 先注册 systemd 服务
+  start_and_verify       # 再启动（systemd 方式读取 .env）
   configure_firewall
   show_summary
 }

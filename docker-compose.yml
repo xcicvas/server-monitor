@@ -12,6 +12,10 @@ services:
     environment:
       - NODE_ENV=production
       - AGENT_PORT=7001
+      - ADMIN_USERNAME=admin
+      - ADMIN_PASSWORD=admin
+      # 建议修改默认密码：
+      # - ADMIN_PASSWORD=你的强密码
       # 如需设置 JWT 密钥：
       # - JWT_SECRET=your_very_long_and_secure_secret_key_here
       # 如需限制 CORS：

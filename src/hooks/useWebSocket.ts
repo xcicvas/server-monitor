@@ -30,6 +30,7 @@ interface ServerIdentity {
   id: string;
   address: string;
   token: string;
+  insecure: boolean;
 }
 
 export function useWebSocketServers(): void {
@@ -41,7 +42,7 @@ export function useWebSocketServers(): void {
   // 关键：只依赖"连接身份签名"，不依赖 metrics/status 等变化字段
   const servers = useServerStore((s) => s.servers);
   const connectSignature = servers
-    .map((s) => `${s.id}|${s.address}|${s.token ? 't' : ''}`)
+    .map((s) => `${s.id}|${s.address}|${s.insecure ? 'insecure' : s.token ? 't' : 'none'}`)
     .join('||');
 
   useEffect(() => {
@@ -58,7 +59,8 @@ export function useWebSocketServers(): void {
     const { setMetrics, setStatus } = useServerStore.getState();
 
     const openConnection = (server: ServerIdentity, attempt = 0): void => {
-      if (!server.token) return;
+      // 安全模式必须有 token；不安全模式不需要 token
+      if (!server.insecure && !server.token) return;
       const wsUrl = buildWsUrl(server.address);
       if (!wsUrl) {
         setStatus(server.id, 'offline');
@@ -67,6 +69,7 @@ export function useWebSocketServers(): void {
 
       let ws: WebSocket;
       try {
+        // 不安全模式：不附加 token query 参数；安全模式：也不附加，消息里发送（和当前一致）
         ws = new WebSocket(wsUrl);
       } catch {
         setStatus(server.id, 'offline');
@@ -76,8 +79,16 @@ export function useWebSocketServers(): void {
 
       ws.onopen = () => {
         if (ws.readyState === WebSocket.OPEN) {
-          ws.send(JSON.stringify({ type: 'auth', token: server.token }));
-          retryCountRef.current.set(server.id, 0);
+          // 不安全模式：跳过 auth 消息，立即标记为 online（Agent 已经自动接受连接）
+          if (server.insecure) {
+            retryCountRef.current.set(server.id, 0);
+            setStatus(server.id, 'online');
+          } else if (server.token) {
+            ws.send(JSON.stringify({ type: 'auth', token: server.token }));
+            retryCountRef.current.set(server.id, 0);
+          } else {
+            ws.close(1000, 'No token');
+          }
         }
       };
 
@@ -91,6 +102,9 @@ export function useWebSocketServers(): void {
             setStatus(server.id, 'online');
           } else if (msg.type === 'auth_error') {
             setStatus(server.id, 'offline');
+          } else if (msg.type === 'connected') {
+            // Agent 不安全模式返回 connected 消息，表明已连接
+            setStatus(server.id, 'online');
           }
         } catch {}
       };
@@ -110,11 +124,11 @@ export function useWebSocketServers(): void {
 
         const t = setTimeout(() => {
           reconnectMapRef.current.delete(server.id);
-          // 重连前再检查一下服务器是否还在列表里、还有 token
+          // 重连前再检查一下服务器是否还在列表里、还有 token（或 insecure）
           const current = useServerStore.getState().servers.find((s) => s.id === server.id);
-          if (!current || !current.token) return;
+          if (!current || (!current.insecure && !current.token)) return;
           openConnection(
-            { id: current.id, address: current.address, token: current.token },
+            { id: current.id, address: current.address, token: current.token, insecure: !!current.insecure },
             nextCount
           );
         }, delay);
@@ -124,8 +138,9 @@ export function useWebSocketServers(): void {
 
     // 初次建立
     for (const server of servers) {
-      if (!server.token) continue;
-      openConnection({ id: server.id, address: server.address, token: server.token }, 0);
+      // 不安全模式：直接连；安全模式：需有 token
+      if (!server.insecure && !server.token) continue;
+      openConnection({ id: server.id, address: server.address, token: server.token, insecure: !!server.insecure }, 0);
     }
 
     // 组件卸载 / effect 重新执行时清理

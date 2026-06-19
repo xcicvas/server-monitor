@@ -22,6 +22,12 @@ function execCmd(cmd, timeoutMs = 2000) {
   });
 }
 
+// ═══ 运行模式：secure / insecure ═══════════════════════════════════════════
+//   INSECURE_MODE=true  → 不安全模式：不验证 JWT，不启用 Helmet / 限速 / 审计日志 / 超时
+//                        → 面板中添加服务器时勾选『不安全模式』即可直接连接
+//   默认（不设此变量）→ 完全安全模式：JWT + bcrypt + 限速 + 审计 + 超时 + 注册默认关闭
+const INSECURE = process.env.INSECURE_MODE === 'true' || process.env.INSECURE_MODE === '1';
+
 const PORT = Number(process.env.AGENT_PORT) || 7001;
 const JWT_SECRET = process.env.JWT_SECRET || process.env.AUTH_TOKEN || 'change-me-in-production';
 const JWT_EXPIRY = process.env.JWT_EXPIRY || '24h';
@@ -45,9 +51,18 @@ const REQUEST_TIMEOUT_MS = 5000;
 // 生产环境请立即登录后修改密码，或用环境变量 ADMIN_PASSWORD 覆盖默认值
 const DEFAULT_ADMIN_USERNAME = process.env.ADMIN_USERNAME || 'admin';
 const DEFAULT_ADMIN_PASSWORD = process.env.ADMIN_PASSWORD || 'admin';
+// 不安全模式：直接存明文（简单、无需 bcrypt 依赖）；安全模式：bcrypt 哈希
+function hashPassword(pw) {
+  if (INSECURE) return pw;
+  return bcrypt.hashSync(pw, 10);
+}
+async function verifyPassword(pw, stored) {
+  if (INSECURE) return pw === stored;
+  try { return await bcrypt.compare(pw, stored); } catch { return false; }
+}
 const DEFAULT_ADMIN = {
   username: DEFAULT_ADMIN_USERNAME,
-  passwordHash: bcrypt.hashSync(DEFAULT_ADMIN_PASSWORD, 10),
+  passwordHash: hashPassword(DEFAULT_ADMIN_PASSWORD),
   createdAt: Date.now(),
 };
 
@@ -101,6 +116,7 @@ const auditQueue = [];
 let auditFlushTimer = null;
 
 function audit(action, ip, detail = '') {
+  if (INSECURE) return;
   const ts = new Date().toISOString();
   auditQueue.push(`[${ts}] [${action}] ip=${ip} ${detail}\n`);
   if (auditFlushTimer) return;
@@ -145,6 +161,11 @@ function rateLimitMiddleware(req, res, next) {
 
 // ─── JWT 验证中间件 ─────────────────────────────────────────────────────────
 function verifyToken(req, res, next) {
+  if (INSECURE) {
+    // 不安全模式：不验证 token，伪造一个匿名用户
+    req.user = { username: 'anonymous' };
+    return next();
+  }
   const auth = req.headers.authorization;
   if (!auth || !auth.startsWith('Bearer ')) {
     return res.status(401).json({ ok: false, error: '未提供访问令牌' });
@@ -450,25 +471,30 @@ const app = express();
 
 app.set('trust proxy', 1);
 
-app.use(helmet({
-  contentSecurityPolicy: {
-    directives: {
-      defaultSrc: ["'self'"],
-      scriptSrc: ["'self'"],
-      styleSrc: ["'self'", "'unsafe-inline'", "https://fonts.googleapis.com"],
-      fontSrc: ["'self'", "https://fonts.gstatic.com"],
-      imgSrc: ["'self'", "data:"],
-      connectSrc: ["'self'"],
-      frameAncestors: ["'none'"],
-      formAction: ["'self'"],
+if (!INSECURE) {
+  app.use(helmet({
+    contentSecurityPolicy: {
+      directives: {
+        defaultSrc: ["'self'"],
+        scriptSrc: ["'self'"],
+        styleSrc: ["'self'", "'unsafe-inline'", "https://fonts.googleapis.com"],
+        fontSrc: ["'self'", "https://fonts.gstatic.com"],
+        imgSrc: ["'self'", "data:"],
+        connectSrc: ["'self'"],
+        frameAncestors: ["'none'"],
+        formAction: ["'self'"],
+      },
     },
-  },
-  crossOriginEmbedderPolicy: false,
-}));
+    crossOriginEmbedderPolicy: false,
+  }));
+}
 
-app.use(express.json({ limit: MAX_BODY_SIZE }));
+app.use(express.json({ limit: INSECURE ? '1mb' : MAX_BODY_SIZE }));
 
-if (STRICT_CORS) {
+// CORS：不安全模式不限制来源
+if (INSECURE) {
+  app.use(cors({ origin: true, methods: ['GET', 'POST'], allowedHeaders: ['Content-Type', 'Authorization'] }));
+} else if (STRICT_CORS) {
   app.use(cors({
     origin: (origin, callback) => {
       if (!origin) return callback(null, true);
@@ -485,8 +511,10 @@ if (STRICT_CORS) {
 app.disable('x-powered-by');
 
 // ─── 全局中间件（限速 + 超时）──────────────────────────────────────────────
-// 所有 /api/* 路由（包括登录、注册、health）都经过限速和超时，防止暴力破解
-app.use('/api', rateLimitMiddleware, timeoutMiddleware);
+// 不安全模式跳过；安全模式：所有 /api/* 路由（包括登录、health）都经过限速和超时
+if (!INSECURE) {
+  app.use('/api', rateLimitMiddleware, timeoutMiddleware);
+}
 
 // ─── 公开路由 ──────────────────────────────────────────────────────────────
 
@@ -507,6 +535,13 @@ app.get('/api/health', (_req, res) => {
 // 登录
 app.post('/api/auth/login', async (req, res) => {
   const ip = (req.ip || req.connection.remoteAddress || '').split(':').pop();
+  // 不安全模式：不需要账号密码，直接签发 token（任何用户名都行）
+  if (INSECURE) {
+    const username = (req.body && req.body.username) || 'anonymous';
+    const token = jwt.sign({ username }, JWT_SECRET, { expiresIn: '30d' });
+    res.json({ ok: true, token, username, insecure: true });
+    return;
+  }
   const { username, password } = req.body || {};
   if (!username || !password) {
     return res.status(400).json({ ok: false, error: '用户名和密码不能为空' });
@@ -517,13 +552,9 @@ app.post('/api/auth/login', async (req, res) => {
     audit('LOGIN_FAIL', ip, `username=${username}`);
     return res.status(401).json({ ok: false, error: '用户名或密码错误' });
   }
-  try {
-    const ok = await bcrypt.compare(password, user.passwordHash);
-    if (!ok) {
-      audit('LOGIN_FAIL', ip, `username=${username}`);
-      return res.status(401).json({ ok: false, error: '用户名或密码错误' });
-    }
-  } catch {
+  const ok = await verifyPassword(password, user.passwordHash);
+  if (!ok) {
+    audit('LOGIN_FAIL', ip, `username=${username}`);
     return res.status(401).json({ ok: false, error: '用户名或密码错误' });
   }
   const token = jwt.sign({ username }, JWT_SECRET, { expiresIn: JWT_EXPIRY });
@@ -531,29 +562,28 @@ app.post('/api/auth/login', async (req, res) => {
   res.json({ ok: true, token, username });
 });
 
-// 注册：需要管理员 JWT 且 REGISTRATION_ALLOWED=true，否则 403
-// 设计：登录是开放的（需要账号才能登录），但创建新账号必须先登录
-// 首次部署：admin/admin 由 bootstrap 自动写入 users.json，登录后立即修改密码
+// 注册：不安全模式 = 直接开放；安全模式 = 需管理员 JWT + REGISTRATION_ALLOWED
 app.post('/api/auth/register', verifyToken, async (req, res) => {
-  if (!REGISTRATION_ALLOWED) {
+  if (!INSECURE && !REGISTRATION_ALLOWED) {
     return res.status(403).json({ ok: false, error: '注册功能已禁用（如需开启请设置 ALLOW_REGISTER=true 后重启）' });
   }
   const { username, password } = req.body || {};
   if (!username || !password) {
     return res.status(400).json({ ok: false, error: '用户名和密码不能为空' });
   }
-  if (username.length < 3 || password.length < 8) {
-    return res.status(400).json({ ok: false, error: '用户名至少3位，密码至少8位' });
-  }
-  // 用户名：只允许字母数字下划线
-  if (!/^[a-zA-Z0-9_]+$/.test(username)) {
-    return res.status(400).json({ ok: false, error: '用户名只能包含字母、数字和下划线' });
+  if (!INSECURE) {
+    if (username.length < 3 || password.length < 8) {
+      return res.status(400).json({ ok: false, error: '用户名至少3位，密码至少8位' });
+    }
+    if (!/^[a-zA-Z0-9_]+$/.test(username)) {
+      return res.status(400).json({ ok: false, error: '用户名只能包含字母、数字和下划线' });
+    }
   }
   const users = loadUsers();
   if (!Array.isArray(users)) {
     return res.status(500).json({ ok: false, error: '用户数据不可用' });
   }
-  if (users.length >= 10) {
+  if (!INSECURE && users.length >= 10) {
     return res.status(403).json({ ok: false, error: '账号数量已达上限（10个）' });
   }
   if (users.some((u) => u.username === username)) {
@@ -561,14 +591,15 @@ app.post('/api/auth/register', verifyToken, async (req, res) => {
   }
   users.push({
     username,
-    passwordHash: await bcrypt.hash(password, 10),
+    passwordHash: hashPassword(password),
     createdAt: Date.now(),
     createdBy: req.user && req.user.username ? req.user.username : 'admin',
   });
   saveUsers(users);
-  const ip = (req.ip || '').split(':').pop();
-  audit('REGISTER', ip, `username=${username} by=${req.user && req.user.username}`);
-  // 注册成功不再返回 token — 要获取 token 走登录接口
+  if (!INSECURE) {
+    const ip = (req.ip || '').split(':').pop();
+    audit('REGISTER', ip, `username=${username} by=${req.user && req.user.username}`);
+  }
   res.json({ ok: true, username });
 });
 
@@ -608,25 +639,25 @@ app.get('/api/history', verifyToken, (req, res) => {
   }
 });
 
-// 改密（已登录用户）
+// 改密（已登录用户）：不安全模式跳过密码校验
 app.post('/api/auth/change-password', verifyToken, async (req, res) => {
   const { oldPassword, newPassword } = req.body || {};
-  if (!oldPassword || !newPassword || newPassword.length < 6) {
-    return res.status(400).json({ ok: false, error: '新密码至少6位' });
+  if (!newPassword || newPassword.length < (INSECURE ? 0 : 6)) {
+    return res.status(400).json({ ok: false, error: INSECURE ? '新密码不能为空' : '新密码至少6位' });
   }
   const users = loadUsers();
   const idx = users.findIndex((u) => u.username === req.user.username);
   if (idx < 0) return res.status(404).json({ ok: false, error: '用户不存在' });
-  try {
-    const ok = await bcrypt.compare(oldPassword, users[idx].passwordHash);
+  if (!INSECURE) {
+    const ok = await verifyPassword(oldPassword, users[idx].passwordHash);
     if (!ok) return res.status(403).json({ ok: false, error: '原密码错误' });
-  } catch {
-    return res.status(403).json({ ok: false, error: '原密码错误' });
   }
-  users[idx].passwordHash = await bcrypt.hash(newPassword, 10);
+  users[idx].passwordHash = hashPassword(newPassword);
   saveUsers(users);
-  const ip = (req.ip || '').split(':').pop();
-  audit('PASSWORD_CHANGE', ip, `username=${req.user.username}`);
+  if (!INSECURE) {
+    const ip = (req.ip || '').split(':').pop();
+    audit('PASSWORD_CHANGE', ip, `username=${req.user.username}`);
+  }
   res.json({ ok: true });
 });
 
@@ -666,8 +697,24 @@ const broadcastInterval = setInterval(broadcastMetrics, 10_000);
 
 wss.on('connection', (ws, req) => {
   const ip = (req.socket.remoteAddress || '').split(':').pop();
-  let authenticated = false;
-  let userInfo = null;
+  let authenticated = INSECURE; // 不安全模式默认为已认证
+  let userInfo = INSECURE ? { username: 'anonymous' } : null;
+
+  if (INSECURE) {
+    ws.user = userInfo;
+    wsClients.add(ws);
+    (async () => {
+      try {
+        const m = await getSystemMetrics();
+        ws.send(JSON.stringify({ type: 'metrics', data: m, ts: Date.now() }));
+      } catch {}
+    })();
+    ws.send(JSON.stringify({ type: 'connected', username: 'anonymous', uptime: process.uptime() }));
+    // 不安全模式：消息处理跳过认证
+    ws.on('close', () => wsClients.delete(ws));
+    ws.on('error', () => wsClients.delete(ws));
+    return;
+  }
 
   const url = new URL(req.url, `http://localhost`);
   const queryToken = url.searchParams.get('token');
@@ -769,6 +816,34 @@ process.on('uncaughtException', (err) => {
 });
 
 server.listen(PORT, '0.0.0.0', () => {
+  if (INSECURE) {
+    // 不安全模式：简单、醒目、红色警告
+    console.log(`
+╔══════════════════════════════════════════════════════════╗
+║  🖥️  服务器监控 Agent （不安全模式）                       ║
+╠══════════════════════════════════════════════════════════╣
+║  端口:      ${String(PORT).padEnd(43)}║
+║  认证:      ⛔ 已关闭（任何人均可连接）                    ║
+║  CORS:      ⚠️  未限制来源                                ║
+║  安全头:    ⛔ 已关闭（Helmet 未启用）                     ║
+║  限速:      ⛔ 已关闭                                      ║
+║  超时:      ⛔ 已关闭                                      ║
+║  注册:      ✅ 开放（无需管理员 JWT）                      ║
+║  WebSocket: ✅ ws://localhost:${PORT}/ws                    ║
+║  历史:      ✅ 近 ${HISTORY_MAX} 条（${(HISTORY_MAX * 10 / 60).toFixed(0)} 分钟）                       ║
+║  审计日志:  ⛔ 已关闭                                      ║
+╠══════════════════════════════════════════════════════════╣
+║  ⚠️  警告：不安全模式仅用于开发 / 内网 / 受信任环境       ║
+║      生产环境请移除 INSECURE_MODE 环境变量                 ║
+╠══════════════════════════════════════════════════════════╣
+║  HTTP:    http://localhost:${PORT}/api/metrics            ║
+║  WS:      ws://localhost:${PORT}/ws                       ║
+║  Health:  http://localhost:${PORT}/api/health             ║
+╚══════════════════════════════════════════════════════════╝
+`);
+    return;
+  }
+
   const originHint = STRICT_CORS
     ? `✅ 仅允许 ${ALLOWED_ORIGINS.length} 个来源`
     : '⚠️ 未限制来源（建议内网使用）';

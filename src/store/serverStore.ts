@@ -221,6 +221,7 @@ export interface ServerData {
   token: string;
   username: string;
   password: string;
+  insecure: boolean; // 不安全模式：Agent 开启 INSECURE_MODE 时为 true，跳过 JWT 认证
   interval: number;
   createdAt: number;
   status: 'online' | 'offline' | 'checking';
@@ -231,7 +232,7 @@ export interface ServerData {
 
 interface ServerStore {
   servers: ServerData[];
-  addServer: (data: { name: string; address: string; token?: string; username?: string; password?: string; interval: number }) => void;
+  addServer: (data: { name: string; address: string; token?: string; username?: string; password?: string; insecure?: boolean; interval: number }) => void;
   removeServer: (id: string) => void;
   updateServer: (id: string, updates: Partial<ServerData>) => void;
   setStatus: (id: string, status: ServerData['status']) => void;
@@ -247,7 +248,7 @@ export const useServerStore = create<ServerStore>()(
       servers: [],
 
       // 内存中保持明文，storage 层自动加解密敏感字段（token/username/password）
-      addServer: ({ name, address, token = '', username = '', password = '', interval }) =>
+      addServer: ({ name, address, token = '', username = '', password = '', insecure = false, interval }) =>
         set((state) => ({
           servers: [
             {
@@ -257,6 +258,7 @@ export const useServerStore = create<ServerStore>()(
               token,
               username,
               password,
+              insecure,
               interval,
               createdAt: Date.now(),
               status: 'checking',

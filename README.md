@@ -151,7 +151,21 @@ sudo ./deploy.sh \
 
 脚本自动完成：检测系统 → 安装 Node.js → 复制 agent.js → 装依赖 → 配置账号 → 注册 systemd → 开放防火墙。
 
-#### 方式 B：Docker 部署 Agent
+#### 方式 B：不安全模式（内网 / 开发环境）
+
+Agent 支持 `INSECURE_MODE=true` — 关闭所有认证 / 限速 / helmet / 审计日志，面板直接通过 WebSocket 连接。
+
+```bash
+# 🔓 不安全模式：任何人可连接。仅推荐内网/开发环境
+INSECURE_MODE=true node api/agent.js
+
+# 🔒 安全模式：需账号密码登录，JWT 认证（默认）
+node api/agent.js
+```
+
+面板中添加该服务器时勾选「不安全模式」即可跳过登录步骤。
+
+#### 方式 C：Docker 部署 Agent
 
 ```bash
 docker run -d \
@@ -169,7 +183,7 @@ docker run -d \
 
 > 或者用仓库自带的 `docker-compose.yml`（包含 agent + panel 两个容器）
 
-#### 方式 C：本地直接运行（最简单，适合测试）
+#### 方式 D：本地直接运行（最简单，适合测试）
 
 ```bash
 git clone https://github.com/xcicvas/server-monitor.git

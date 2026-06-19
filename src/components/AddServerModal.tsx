@@ -11,6 +11,7 @@ interface AddServerModalProps {
     token: string;
     username: string;
     password: string;
+    insecure: boolean;
     interval: number;
   }) => void;
 }
@@ -27,6 +28,7 @@ export function AddServerModal({ isOpen, onClose, onAdd }: AddServerModalProps) 
   const [address, setAddress] = useState('');
   const [username, setUsername] = useState('');
   const [password, setPassword] = useState('');
+  const [insecure, setInsecure] = useState(false);
   const [errors, setErrors] = useState<Record<string, string>>({});
   const [loginError, setLoginError] = useState('');
   const [loading, setLoading] = useState(false);
@@ -43,6 +45,7 @@ export function AddServerModal({ isOpen, onClose, onAdd }: AddServerModalProps) 
     setAddress('');
     setUsername('');
     setPassword('');
+    setInsecure(false);
     setErrors({});
     setLoginError('');
     setLoading(false);
@@ -64,8 +67,10 @@ export function AddServerModal({ isOpen, onClose, onAdd }: AddServerModalProps) 
         e.address = '地址格式不正确';
       }
     }
-    if (!username.trim()) e.username = '请输入用户名';
-    if (!password) e.password = '请输入密码';
+    if (!insecure) {
+      if (!username.trim()) e.username = '请输入用户名';
+      if (!password) e.password = '请输入密码';
+    }
     setErrors(e);
     return Object.keys(e).length === 0;
   };
@@ -94,20 +99,24 @@ export function AddServerModal({ isOpen, onClose, onAdd }: AddServerModalProps) 
     setLoginError('');
 
     try {
-      const login = await loginAgent(urlStr, username, password);
-
-      if (!login.ok) {
-        setLoginError(login.error || '登录失败，请检查用户名和密码');
-        setLoading(false);
-        return;
+      let finalToken = '';
+      if (!insecure) {
+        const login = await loginAgent(urlStr, username, password);
+        if (!login.ok) {
+          setLoginError(login.error || '登录失败，请检查用户名和密码');
+          setLoading(false);
+          return;
+        }
+        finalToken = login.token || '';
       }
 
       onAdd({
         name: name.trim(),
         address: urlStr,
-        token: login.token || '',
-        username: username.trim(),
-        password: password,
+        token: finalToken,
+        username: insecure ? '' : username.trim(),
+        password: insecure ? '' : password,
+        insecure,
         interval: 10,
       });
       reset();
@@ -209,40 +218,62 @@ export function AddServerModal({ isOpen, onClose, onAdd }: AddServerModalProps) 
             )}
           </div>
 
-          <div>
-            <label className="block text-xs font-semibold text-stone-500 uppercase tracking-wider mb-1.5">
-              用户名 <span className="text-red-400 normal-case">*</span>
+          {/* 不安全模式开关 */}
+          <div className="flex items-start gap-2.5 p-3 rounded-xl bg-amber-50 border border-amber-200">
+            <label className="flex items-center gap-2 cursor-pointer select-none">
+              <input
+                type="checkbox"
+                checked={insecure}
+                onChange={(e) => setInsecure(e.target.checked)}
+                disabled={loading}
+                className="w-4 h-4 rounded accent-brand cursor-pointer"
+              />
+              <span className="text-xs font-semibold text-amber-800">不安全模式</span>
             </label>
-            <input
-              type="text"
-              value={username}
-              onChange={(e) => setUsername(e.target.value)}
-              placeholder="admin"
-              className={`input ${errors.username ? 'input-error' : ''}`}
-              autoComplete="username"
-              disabled={loading}
-            />
-            {errors.username && <p className="mt-1.5 text-xs text-red-500">{errors.username}</p>}
-          </div>
-
-          <div>
-            <label className="block text-xs font-semibold text-stone-500 uppercase tracking-wider mb-1.5">
-              密码 <span className="text-red-400 normal-case">*</span>
-            </label>
-            <input
-              type="password"
-              value={password}
-              onChange={(e) => setPassword(e.target.value)}
-              placeholder="••••••"
-              className={`input ${errors.password ? 'input-error' : ''}`}
-              autoComplete="current-password"
-              disabled={loading}
-            />
-            {errors.password && <p className="mt-1.5 text-xs text-red-500">{errors.password}</p>}
-            <p className="mt-1.5 text-xs text-stone-400">
-              默认：admin / admin（首次登录后请修改密码）
+            <p className="text-xs text-amber-700 leading-relaxed">
+              Agent 已开启 <code className="font-mono text-[10px] bg-amber-100 px-1 py-0.5 rounded">INSECURE_MODE=true</code> 时使用，跳过 JWT 登录。仅推荐内网/开发环境。
             </p>
           </div>
+
+          {/* 用户名/密码：仅安全模式显示 */}
+          {!insecure && (
+            <>
+              <div>
+                <label className="block text-xs font-semibold text-stone-500 uppercase tracking-wider mb-1.5">
+                  用户名 <span className="text-red-400 normal-case">*</span>
+                </label>
+                <input
+                  type="text"
+                  value={username}
+                  onChange={(e) => setUsername(e.target.value)}
+                  placeholder="admin"
+                  className={`input ${errors.username ? 'input-error' : ''}`}
+                  autoComplete="username"
+                  disabled={loading}
+                />
+                {errors.username && <p className="mt-1.5 text-xs text-red-500">{errors.username}</p>}
+              </div>
+
+              <div>
+                <label className="block text-xs font-semibold text-stone-500 uppercase tracking-wider mb-1.5">
+                  密码 <span className="text-red-400 normal-case">*</span>
+                </label>
+                <input
+                  type="password"
+                  value={password}
+                  onChange={(e) => setPassword(e.target.value)}
+                  placeholder="••••••"
+                  className={`input ${errors.password ? 'input-error' : ''}`}
+                  autoComplete="current-password"
+                  disabled={loading}
+                />
+                {errors.password && <p className="mt-1.5 text-xs text-red-500">{errors.password}</p>}
+                <p className="mt-1.5 text-xs text-stone-400">
+                  默认：admin / admin（首次登录后请修改密码）
+                </p>
+              </div>
+            </>
+          )}
 
           {loginError && (
             <div className="flex items-center gap-2 p-3 rounded-xl bg-red-50 border border-red-100 text-xs text-red-600">
@@ -268,7 +299,7 @@ export function AddServerModal({ isOpen, onClose, onAdd }: AddServerModalProps) 
               {loading ? (
                 <>
                   <Loader className="w-4 h-4 animate-spin" strokeWidth={2} />
-                  登录中...
+                  {insecure ? '添加中...' : '登录中...'}
                 </>
               ) : '添加'}
             </button>

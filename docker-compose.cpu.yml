@@ -3,6 +3,7 @@ services:
     build:
       context: ./backend
       dockerfile: Dockerfile
+    container_name: photo-depth_backend
     restart: unless-stopped
     ports:
       - "8000:8000"
@@ -10,12 +11,12 @@ services:
       - ./data:/data
     environment:
       - PYTHONUNBUFFERED=1
-    # CPU 模式：无 GPU 相关配置
 
   frontend:
     build:
       context: ./frontend
       dockerfile: Dockerfile
+    container_name: photo-depth_frontend
     restart: unless-stopped
     ports:
       - "3000:80"

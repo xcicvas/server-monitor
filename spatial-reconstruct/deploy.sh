@@ -33,26 +33,21 @@ fi
 # 2. 创建目录并下载
 echo "[2/5] 下载最新代码..."
 mkdir -p "$TARGET_DIR"
-cd /tmp
+TMPDIR=$(mktemp -d)
 
 if command -v curl &> /dev/null; then
-    curl -fsSL "$ARCHIVE_URL" -o spatial-reconstruct.tar.gz
+    curl -fsSL "$ARCHIVE_URL" -o "$TMPDIR/spatial.tar.gz"
 elif command -v wget &> /dev/null; then
-    wget -q "$ARCHIVE_URL"
+    wget -q "$ARCHIVE_URL" -O "$TMPDIR/spatial.tar.gz"
 else
     echo "错误: 需要 curl 或 wget"
     exit 1
 fi
 
-# 解压并移动文件到目标目录
-tar -xzvf spatial-reconstruct.tar.gz
-# tar 解压出来是 spatial-reconstruct/ 目录
-# 如果当前目录已有同名目录，tar 会报错，先检查
-if [ -d "$TARGET_DIR" ]; then
-    rm -rf "$TARGET_DIR"
-fi
-mv spatial-reconstruct "$TARGET_DIR"
-rm -f spatial-reconstruct.tar.gz
+tar -xzvf "$TMPDIR/spatial.tar.gz" -C "$TMPDIR"
+# 解压出来是 spatial-reconstruct 目录，直接移过去
+cp -rf "$TMPDIR/spatial-reconstruct/"* "$TARGET_DIR/"
+rm -rf "$TMPDIR"
 
 echo "  下载完成: $TARGET_DIR"
 ls -la "$TARGET_DIR"

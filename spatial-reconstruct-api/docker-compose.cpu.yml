@@ -1,0 +1,18 @@
+version: '3.8'
+
+# CPU / Mac M-series 版本（无 NVIDIA GPU）
+# 用法: docker-compose -f docker-compose.yml -f docker-compose.cpu.yml up
+
+services:
+  backend:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    environment:
+      - CUDA_VISIBLE_DEVICES=-1
+      - MODEL_CACHE_DIR=/model-cache
+      - MAX_IMAGE_SIZE=2048
+    deploy:
+      resources:
+        limits:
+          memory: 8G

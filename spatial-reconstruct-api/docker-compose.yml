@@ -1,0 +1,52 @@
+version: '3.8'
+
+services:
+  # =============================================
+  # 前端 - Nginx 静态服务
+  # =============================================
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+    ports:
+      - "3000:80"
+    depends_on:
+      backend:
+        condition: service_healthy
+    restart: unless-stopped
+    networks:
+      - spatial-net
+
+  # =============================================
+  # 后端 - FastAPI + Depth Pro
+  # =============================================
+  backend:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    ports:
+      - "8000:8000"
+    environment:
+      - CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES:-0}
+      - MODEL_CACHE_DIR=/model-cache
+      - MAX_IMAGE_SIZE=4096
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/api/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 60s
+    restart: unless-stopped
+    networks:
+      - spatial-net
+
+networks:
+  spatial-net:
+    driver: bridge
